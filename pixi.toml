@@ -1,5 +1,5 @@
 [workspace]
-authors = ["Damien LaRocque <phicoltan@gmail.com>"]
+authors = ["jwang771 <jwanggpt@gmail.com>"]
 channels = ["nvidia", "conda-forge"]
 name = "3dws"
 platforms = ["linux-64"]
