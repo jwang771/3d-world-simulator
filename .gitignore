@@ -6,3 +6,4 @@ __pycache__/
 *.npz
 data/
 runs/
+sim/shoe_return/assets/shoes/
