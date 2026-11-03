@@ -6,3 +6,7 @@ __pycache__/
 *.npz
 data/
 runs/
+
+# pixi environments
+.pixi/*
+!.pixi/config.toml
