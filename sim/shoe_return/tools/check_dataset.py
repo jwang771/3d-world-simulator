@@ -70,7 +70,11 @@ def check_episode(path, task, n_frames):
         if not torch.isfinite(s["xyz"]).all():
             problems.append(f"non-finite points at frame {t}")
         if int(s["obj_label"].sum()) == 0:
-            problems.append(f"no shoe points at frame {t}")
+            # Shoes must be visible at the start; at the end of a successful episode they are inside a closed box,
+            # where no camera sees them.
+            closed_at_end = gi == picks[-1] and bool(h5py.File(path, "r").attrs.get("success", False))
+            if not closed_at_end:
+                problems.append(f"no shoe points at frame {t}")
         frames.render(fi, t)
         frames.depth(fi, t)
         load_frame(root / "robot_label_cache", ep, t, shapes, torch.tensor(bounds[0]), torch.tensor(bounds[1]), "cpu")
