@@ -139,3 +139,16 @@ Further expert fixes, each from an observed failure: box turned so the hinge fac
 | Video | | `docs/media/t1_scripted_success.mp4` (front, overhead, right wrist; scripted success, seed 1000) |
 
 **Phase 4, round 1 (ran; result: no success).** ACT and Diffusion Policy trained 20k steps each on 13 successful training-shoe episodes (8421 samples, seed 0; train L1 0.017 / denoising MSE 0.0037). Closed-loop on held-out shoes: ACT **0/3**, Diffusion Policy **0/2** (evaluations stopped early to free the machine for data collection). ACT barely moves from where it is (with the previous command as input it learned to repeat it, the "copycat" failure); Diffusion Policy did pinch the lid tab and lift the lid to 30 deg once, then lost it. Round 2 adds image augmentation and drops/noises the proprio input, and trains on more data.
+
+**Expert: what was tried after that, and the measured outcome (all ran; gates run from a frozen worktree).**
+
+| Gate run (seeds 1000-1019) | Code | Result |
+|---|---|---|
+| Gate 2 | `041478b` | 5/7 when stopped (to test a fix) |
+| Gate 3 | `739056f` (toe-pivot set-down, 8 cm box play) | 1/3 when stopped: worse; reverted (`3709e82`) |
+| Gate 4 | `3709e82` (+ "level sole" re-place check) | 0/2 when stopped: the check re-picked shoes that were fine; reverted (`3f6d350`) |
+| Gate 5 | `3f6d350` (= `041478b` + an end-of-episode debug print) | see below |
+
+Failure classes that remain (from `[end]` diagnostics and frames): (1) the second shoe ends propped or tilted (its top up to 9-11 cm above the rim), so the lid cannot close; this is the most common; (2) a heel-pinched shoe rolls about the closing axis or slips out in transit (the collar pinch resists twist poorly); (3) a few shoe models fail every time (Mako moccasin, Nellie chukka boot).
+
+**Phase 4, round 2 (ran; result: no success).** 23 successful episodes from 14 distinct training shoes (none of the 12 held-out shoes), copied into one dataset. ACT trained without proprio input (cameras only) plus image shift/colour augmentation; Diffusion Policy with proprio noise (0.1) plus the same augmentation; 20k steps each, seed 0. Closed-loop on held-out shoes (seeds 9000-9009, 16000-step limit): **ACT 0/10, Diffusion Policy 0/10.** ACT without proprio no longer freezes but jumps between poses and never pinches the lid tab; Diffusion Policy mostly hovers near its start pose. 23 demonstrations of a ~600-step, two-arm, multi-stage task is far too little data for either method; the M4 target (70% on held-out shoes) is not met.
