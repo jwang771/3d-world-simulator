@@ -652,9 +652,7 @@ class Lid:
 
         def at(standoff):
             def goal(arm):
-                if "deg" not in state:  # a new grasp (possibly by the other arm) picks its own tab-pinch yaw
-                    state["deg"], self.T_lid_tcp = self.cell.hinge_deg(), None
-                return self.tcp_at(state["deg"], arm, standoff)
+                return self.tcp_at(state.setdefault("deg", self.cell.hinge_deg()), arm, standoff)
 
             return goal
 
@@ -765,10 +763,7 @@ def script(cell, lid):
                             Move(up(0.05), speed=0.05), Branch(released, unhook), Move(up(0.10), speed=0.15)]
         # After letting go, check the shoe lies flat in the box (heel within 2.5 cm of resting on the floor); a shoe
         # left propped on the end wall or on the other shoe stops the lid. If not, pick it up and place it again, once.
-        # Flat = heel near the floor *and* sole roughly horizontal (a shoe resting on its heel with the toe up passed
-        # the heel check alone and stood 9 cm above the rim, blocking the lid).
-        flat = lambda arm: (shoe_in_box(cell, pl.k) and grasp_point(cell, pl.k)[2] < pl.rest_tcp_z() + 0.015
-                            and cell.shoe_pose(pl.k)[2, 2] > 0.95)
+        flat = lambda arm: shoe_in_box(cell, pl.k) and grasp_point(cell, pl.k)[2] < pl.rest_tcp_z() + 0.015
         redo = [Branch(flat, lambda: [home_j(), *pick(pl.k, retries=1), *place(pl, retries=0)])] if retries else []
         return [MoveJ(pl(CARRY_DZ)), *([recheck(retries)] if retries else []), Branch(dropped_in, set_down), *redo]
 
@@ -784,7 +779,6 @@ def script(cell, lid):
                       "right": [MoveJ(heel_grasp(cell, 0, 0.12), grip=1.0)]}),
         ("place_shoes", {"right": [*pick(0), *place(place1), home_j(), *pick(1), *place(place2), home_j()]}),
         # Re-grasp the tab where the lid stands and swing it shut; if it does not seat, press it down from above.
-        # (Tried with the right arm: it could not swing the lid down from vertical.)
         ("close_lid", {"left": [*lid.grasp(), *lid.swing(LID_CLOSED_DEG, timeout=2400), hold(50, 1.0), Move(back_off(0.08)),
                                 Branch(lambda arm: cell.hinge_deg() < 4.0, lid.push_closed), home_j()]}),
     ]
