@@ -810,6 +810,7 @@ class PolicyRunner:
         self.model = build(cfg["kind"], **cfg.get("model", {}), chunk=cfg["chunk"], pretrained=False).cuda().eval()
         self.model.load_state_dict(ck["state"])
         self.lo, self.hi = np.array(ck["stats"]["lo"], np.float32), np.array(ck["stats"]["hi"], np.float32)
+        self.no_proprio = cfg.get("proprio") == "none"  # trained without the previous command (see policy/train.py)
         self.period = args.record_every * pdata.STRIDE  # physics steps per policy step
         self.reset()
 
@@ -824,6 +825,8 @@ class PolicyRunner:
             imgs = np.stack([cv2.resize(frames[c]["rgb"], (pd.IMG_HW[1], pd.IMG_HW[0]), interpolation=cv2.INTER_AREA) for c in pd.CAMS])
             prev = pd.to_policy_action(np.concatenate([arms["left"].action(), arms["right"].action()])[None])[0]
             prev = 2 * (prev - self.lo) / np.maximum(self.hi - self.lo, 1e-4) - 1
+            if self.no_proprio:
+                prev = np.zeros_like(prev)
             x = torch.from_numpy(imgs).permute(0, 3, 1, 2).float().div(255).unsqueeze(0).cuda()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = self.model.act(x, torch.from_numpy(prev).float().unsqueeze(0).cuda())

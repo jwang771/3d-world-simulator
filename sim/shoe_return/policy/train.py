@@ -31,6 +31,29 @@ def git_commit():
         return "unknown"
 
 
+def augment(imgs, prop, cfg):
+    """Training-time augmentation. Random shifts and brightness/contrast jitter of each camera image (generalise to
+    unseen shoes and lighting), and proprio noise or dropout: with the previous command as input, a policy trained on
+    few demonstrations learns to repeat it and never progresses (the copycat problem)."""
+    B, C = imgs.shape[:2]
+    if cfg.get("aug_shift", 0):
+        pad = cfg["aug_shift"]
+        x = torch.nn.functional.pad(imgs.flatten(0, 1), (pad,) * 4, mode="replicate")
+        H, W = imgs.shape[-2:]
+        i, j = np.random.randint(0, 2 * pad + 1, 2)
+        imgs = x[..., i:i + H, j:j + W].view_as(imgs)
+    if cfg.get("aug_color", 0):
+        a = cfg["aug_color"]
+        gain = 1 + (torch.rand(B, C, 1, 1, 1, device=imgs.device) * 2 - 1) * a
+        bias = (torch.rand(B, C, 1, 1, 1, device=imgs.device) * 2 - 1) * a / 2
+        imgs = (imgs * gain + bias).clamp(0, 1)
+    if cfg.get("proprio") == "none":
+        prop = torch.zeros_like(prop)
+    elif cfg.get("proprio_noise", 0):
+        prop = prop + torch.randn_like(prop) * cfg["proprio_noise"]
+    return imgs, prop
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -67,6 +90,7 @@ def main():
     while step < total:
         for imgs, prop, act, pad in dl:
             imgs, prop, act, pad = imgs.to(dev, non_blocking=True), prop.to(dev), act.to(dev), pad.to(dev)
+            imgs, prop = augment(imgs, prop, cfg)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss, parts = model.loss(imgs, prop, act, pad)
             opt.zero_grad(set_to_none=True)
