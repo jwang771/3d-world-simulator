@@ -1046,6 +1046,16 @@ def main():
                 step(render=False)
             inside = [shoe_in_box(cell, i) for i in range(2)]
             hinge = cell.hinge_deg()
+            if args.debug:
+                rim = cell.box_pose()[2, 3] + S.BOX["height"]
+                tops = []
+                for i in range(2):
+                    T = cell.shoe_pose(i)
+                    corners = np.array([[sx * cell.meta["length"] / 2, sy * cell.meta["width"] / 2, sz * cell.meta["height"], 1.0]
+                                        for sx in (-1, 1) for sy in (-1, 1) for sz in (0, 1)])
+                    tops.append(float((T @ corners.T)[2].max()))
+                print(f"[end] shoe tops above rim {np.round(np.array(tops) - rim, 3)} m; left arm q "
+                      f"{np.round(np.rad2deg(arms['left'].joint_pos())).astype(int)}", flush=True)
             ok = finished and all(inside) and hinge < 5.0 and not dropped and min_gap > ARM_CLEARANCE
             reason = None if ok else ("shoe_dropped" if dropped else "timeout" if not finished else "arm_collision" if min_gap <= ARM_CLEARANCE else "shoe_outside_box" if not all(inside) else "lid_open")
             wall = time.time() - t0
