@@ -207,9 +207,10 @@ def style_box(box, rng):
 
 def size_box_for(length, width, height):
     """The box fits the pair heel-to-toe with play (updates BOX in place). 6 cm of length play: a shoe is set
-    down 2 cm toward its toe, leaving room behind the heel for the gripper finger that pinches the heel counter."""
-    BOX["inner"] = (round(length + 0.06, 3), round(2 * width + 0.025, 3))
-    BOX["height"] = round(height + 0.012, 3)
+    down 2 cm toward its toe, leaving room behind the heel for the gripper finger that pinches the heel counter.
+    4 cm of width play across the pair: a few degrees of heading error otherwise lands one shoe on the other."""
+    BOX["inner"] = (round(length + 0.06, 3), round(2 * width + 0.04, 3))
+    BOX["height"] = round(height + 0.025, 3)  # 2.5 cm headroom: with 1.2 cm a shoe resting slightly propped up stopped the lid
 
 
 # 2F-85 inner gap is ~85 mm at finger_joint 0 and closes at ~0.8 rad; roughly linear in between.

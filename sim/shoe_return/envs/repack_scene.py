@@ -132,9 +132,11 @@ def make_scene_cfg(assets, width, height, wrist_cams=True, num_envs=1):
         ),
         init_state=ArticulationCfg.InitialStateCfg(pos=(*S.BOX_NOMINAL["center"], S.TABLE_Z), joint_pos={"lid_hinge": 0.0}),
         # Cardboard hinge: enough damping that a released lid settles rather than slams (lid gravity torque <= 0.2 Nm).
-        # A paperboard hinge is stiff: a lid nudged near vertical creeps rather than flops shut. Heavy damping models
-        # that (with 0.25 an open lid brushed by a carried shoe fell closed); gravity near vertical is ~0.02 Nm.
-        actuators={"hinge": ImplicitActuatorCfg(joint_names_expr=["lid_hinge"], stiffness=0.0, damping=2.0)},
+        # A creased paperboard hinge stays roughly where it is left: static (Coulomb) friction 0.06 N m holds a released
+        # lid anywhere above ~70 deg (lid weight torque 0.19 N m flat, ~0.03 N m at 80 deg), while a closed lid stays
+        # closed and the arm overcomes it easily. (Frictionless, an open lid crept or was knocked shut.)
+        actuators={"hinge": ImplicitActuatorCfg(joint_names_expr=["lid_hinge"], stiffness=0.0, damping=0.5,
+                                                friction=0.06, dynamic_friction=0.04)},
     )
     for k in range(2):
         setattr(

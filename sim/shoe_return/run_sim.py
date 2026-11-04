@@ -58,13 +58,16 @@ from geometry import mat_to_quat, mat_to_rotvec, pose, quat_to_mat, rot_x, rot_z
 PHYSICS_HZ = 120
 HOME = {"left": np.array([-0.45, 0.02, 0.35]), "right": np.array([0.40, 0.02, 0.35])}
 RIGHT_WAIT = np.array([0.30, -0.18, 0.30])
-LID_HOLD_DEG = 92.0  # held open by the left arm during packing
+LID_HOLD_DEG = 95.0  # held open by the left arm during packing: past vertical, so the lid's weight presses it open
+# against the (compliant) hand and the 98 deg stop instead of sagging over the box
 LID_OPEN_DEG = 95.0  # past vertical: the lid then rests open on its 98 deg stop by itself. (A 105 deg stop put the
 # tab out of comfortable reach for closing. The swing can stall short of vertical for some box poses: it is
 # time-limited and followed by a push on the lid's inner face if needed.)
 LID_CLOSED_DEG = 2.0
-CARRY_JOINT_SPEED = 0.6  # rad/s, joint-space speed with a shoe in hand (at 0.9 a heel-held shoe was flung out)
+CARRY_JOINT_SPEED = 0.35  # rad/s, joint-space speed with a shoe in hand (a heel-held shoe swings like a pendulum; at 0.6 one was flung out)
 LID_BUFFER = 0.05  # m, extra clearance around the lid for collision-checked transits
+RELEASE = 2.0  # grip command: open fully (85 mm). Used once a shoe rests flat in the box: at pinch width the pads
+# still dragged a thick heel wall up with the hand.
 TOE_SHIFT = 0.02  # m, a placed shoe sits this far toward its toe from the box's centre line
 # A heel-held shoe hangs toe-down, its toe up to a shoe length (~0.3 m) below the hand: lift and carry high enough
 # that it clears the box walls (a toe that caught the box corner knocked the shoe out of the fingers).
@@ -132,7 +135,8 @@ def prepare_assets(cache, rng, shoe="random"):
         else:
             meta = dict(name=name, grasp_local=(np.asarray(m["grasp"]) - [0, 0, args.grasp_depth]).tolist(), closing_axis="x",
                         open=S.finger_angle_for_gap(m["pinch_open_width"]))
-        meta.update(length=m["length"], width=m["width"], height=m["height"], mass=m["mass"])
+        meta.update(length=m["length"], width=m["width"], height=m["height"], mass=m["mass"],
+                    wall=m.get("wall", 0.02), opening=m.get("opening", 0.09))
     S.size_box_for(meta["length"], meta["width"], meta["height"])
     S.write_shoebox_usd(out["shoebox"], rng)
     out["shoe_meta"] = meta
@@ -356,7 +360,7 @@ class Arm:
             m.k += 1
             a, b, dur = m.segs[m.i]
             s = min(1.0, m.k / dur)
-            s = s * s * (3 - 2 * s)
+            s = s ** 3 * (10 - 15 * s + 6 * s * s)  # minimum jerk: a hanging shoe is not jolted at the ends
             self.q_cmd = a + (b - a) * s
             T = self.model_tcp(self.q_cmd)
             self.p, self.R = T[:3, 3], T[:3, :3]
@@ -451,11 +455,11 @@ class Arm:
         self.apply_grip()
 
     def apply_grip(self):
-        g = self.open_pos if self.grip > 0.5 else (args.grip_close or S.GRIP_CLOSED)
+        g = S.GRIP_OPEN if self.grip > 1.5 else self.open_pos if self.grip > 0.5 else (args.grip_close or S.GRIP_CLOSED)
         self.robot.set_joint_position_target_index(target=self.grip_signs * float(g), joint_ids=self.grip_ids)
 
     def action(self):
-        return np.concatenate([self.p, mat_to_rotvec(self.R), [self.grip]])
+        return np.concatenate([self.p, mat_to_rotvec(self.R), [min(self.grip, 1.0)]])  # RELEASE is recorded as open
 
 
 S_UR_JOINTS = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
@@ -534,7 +538,9 @@ class Placement:
         if cap is not None and n > cap:
             e[:2] *= cap / n
         G = self.target()
-        dyaw = wrap(np.arctan2(G[1, 0], G[0, 0]) - np.arctan2(Sh[1, 0], Sh[0, 0]))
+        # Heading from the shoe's lateral (y) axis: a heel-held shoe hangs toe-down, pivoting about y, so its long
+        # axis points nearly straight down (heading from it was noise) while y stays horizontal.
+        dyaw = wrap(np.arctan2(G[1, 1], G[0, 1]) - np.arctan2(Sh[1, 1], Sh[0, 1]))
         return e, dyaw
 
     def __call__(self, dz):
@@ -698,13 +704,13 @@ class Lid:
 
         approach = MoveJ(lambda arm: tool(self.cell.hinge_deg(), arm, 0.06), grip=0.0, joint_speed=1.5)
         press = Track(lambda arm: tool(max(self.cell.hinge_deg() - lead_deg, -2.0), arm, -0.006),
-                      lambda arm: self.cell.hinge_deg() < end_deg, speed=0.10, turn=0.8, timeout=900, compliance=0.5)
+                      lambda arm: self.cell.hinge_deg() < end_deg, speed=0.10, turn=0.8, timeout=900, compliance=0.8)
         return [approach, press, Move(lambda arm: tool(self.cell.hinge_deg(), arm, 0.08), speed=0.1)]
 
 
 def script(cell, lid):
     """Phases; each is (name, {side: [Move]}) and the next starts once both arms are idle."""
-    half_gap = cell.meta["width"] / 2 + 0.006
+    half_gap = cell.meta["width"] / 2 + 0.01  # each shoe centred in its half of the box (see scene.size_box_for)
     place1 = Placement(cell, 0, ((0.0, -half_gap), np.pi))  # toe toward -x
     place2 = Placement(cell, 1, ((0.0, half_gap), 0.0))  # toe toward +x: heel-to-toe
     def pick(k, retries=2):
@@ -738,12 +744,22 @@ def script(cell, lid):
             def toe_shift(arm):
                 x = cell.shoe_pose(pl.k)[:3, 0]
                 return arm.p - [0, 0, 0.05] + np.array([x[0], x[1], 0.0]) / max(np.linalg.norm(x[:2]), 1e-6) * 0.015, arm.R
-            return [Move(lambda arm: (arm.p - [0, 0, 0.05], arm.R), speed=0.05), hold(30, 1.0), Move(toe_shift, speed=0.03),
+            return [Move(lambda arm: (arm.p - [0, 0, 0.05], arm.R), speed=0.05), hold(30, RELEASE), Move(toe_shift, speed=0.03),
                     Move(up(0.05), speed=0.04)]
 
+        def centre_in_collar(arm):
+            # Fully open, the inside finger's centre is ~47.5 mm toe-ward of the TCP; move it to the middle of the
+            # collar opening so neither finger touches the shoe on the way up (boot shafts are short, low collars are
+            # narrow: at a fixed offset one or the other hooked).
+            m = cell.meta
+            d = float(np.clip(m.get("wall", 0.02) / 2 + m.get("opening", 0.09) / 2 - 0.0475, 0.0, 0.02))
+            x = cell.shoe_pose(pl.k)[:3, 0]
+            x = np.array([x[0], x[1], 0.0]) / max(np.linalg.norm(x[:2]), 1e-6)
+            return arm.p + x * d, arm.R
+
         released = lambda arm: grasp_point(cell, pl.k)[2] < pl.rest_tcp_z() + 0.025
-        set_down = lambda: [pl.align(), *pl.descend(), hold(90, 1.0), Move(up(0.05), speed=0.05),
-                            Branch(released, unhook), Move(up(0.10), speed=0.15)]
+        set_down = lambda: [pl.align(), *pl.descend(), hold(90, RELEASE), Move(centre_in_collar, speed=0.02),
+                            Move(up(0.05), speed=0.05), Branch(released, unhook), Move(up(0.10), speed=0.15)]
         return [MoveJ(pl(CARRY_DZ)), *([recheck(retries)] if retries else []), Branch(dropped_in, set_down)]
 
     if args.skill == "pick":
@@ -751,15 +767,14 @@ def script(cell, lid):
     if args.skill == "carry":
         return [("carry", {"right": [*pick(0, retries=0), MoveJ(place1(CARRY_DZ)), MoveJ(heel_grasp(cell, 1, 0.25)), hold(240, 0.0)]})]
     return [
-        # Left arm pinches the pull tab, swings the lid up to about vertical and *holds* it there while the right arm
-        # packs (the spec's "hold" option). Released lids crept shut below vertical or were knocked over, and
-        # regrasping the tab of a fully open lid was at the edge of the arm's reach. Right arm waits, empty, above shoe 1.
-        ("open_lid", {"left": [*lid.grasp(), *lid.swing(LID_HOLD_DEG, timeout=900, keep_compliance=True)],
+        # Left arm pinches the pull tab, swings the lid up past vertical, lets go and clears the box (the creased
+        # hinge holds the lid open). Holding it instead put the left hand right above the second shoe's slot.
+        # Right arm waits, empty, above shoe 1.
+        ("open_lid", {"left": [*lid.grasp(), *lid.swing(LID_OPEN_DEG, timeout=1600), hold(40, 1.0), Move(back_off(0.08)), home_j()],
                       "right": [MoveJ(heel_grasp(cell, 0, 0.12), grip=1.0)]}),
         ("place_shoes", {"right": [*pick(0), *place(place1), home_j(), *pick(1), *place(place2), home_j()]}),
-        # Still holding the tab: swing the lid shut, let go and clear.
-        # If the compliant swing cannot seat the lid, let go and press it shut from above, as a person would.
-        ("close_lid", {"left": [*lid.swing(LID_CLOSED_DEG, timeout=2400), hold(50, 1.0), Move(back_off(0.08)),
+        # Re-grasp the tab where the lid stands and swing it shut; if it does not seat, press it down from above.
+        ("close_lid", {"left": [*lid.grasp(), *lid.swing(LID_CLOSED_DEG, timeout=2400), hold(50, 1.0), Move(back_off(0.08)),
                                 Branch(lambda arm: cell.hinge_deg() < 4.0, lid.push_closed), home_j()]}),
     ]
 
