@@ -125,3 +125,17 @@ The lockfile is Isaac Lab's own `uv.lock` at that commit; it gets copied into `s
 **Status at this point (honest):** 3 single-seed debug episodes succeeded end to end (SUPERSTAR, scripted expert). The first 5-episode mini-gate runs over random shoes and box poses had 0/5 successes with intermediate versions; each failure above was diagnosed from frames and fixed. The 20-episode Phase 0 gate has **not** been run on a stable version yet.
 
 **Policy baselines (Phase 4 code, not yet trained on real data):** `policy/` has ACT and Diffusion Policy in plain PyTorch (ResNet-18 ImageNet backbone via torchvision; no new major library), 6-D rotation actions, receding-horizon closed-loop evaluation in `run_sim.py --policy`, held-out shoe split (`--shoe random:train|test`, 51/12). Smoke-trained 400 steps on 2 episodes and rolled out in Isaac: the pipeline runs; no performance claims.
+
+**Session 2, continued: measured results (all ran).**
+
+Further expert fixes, each from an observed failure: box turned so the hinge faces the left arm; creased-paperboard hinge with static friction (0.06 N m) so a released lid stays open; left arm opens, lets go, later regrasps and closes, with a press-to-close fallback; full-open release with the inside finger centred in the collar; a shoe not lying flat is re-placed once; tighter fine alignment (8 mm, 0.04 rad); box play 6 cm long x 6 cm across x 2.5 cm high; lid gap 6 mm and a 2 mm box contact offset (the lid skirt was landing on the wall top); 24000-step episode limit; gate runs from a frozen `git worktree` so mid-run edits cannot leak into a measurement.
+
+| Run | Code | Result |
+|---|---|---|
+| Mini-gate 6 (seeds 1000-1004, all shoes) | before box/lid fit fixes | 2/5 |
+| Gate 1 (seeds 1000-1019, all shoes) | `d70c650` (frozen) | **6/11 when stopped**; 4 of the 5 failures were the lid stopping on the wall top (fixed in `be473e9`), 1 a shoe dropped in transit. Stopped because it could no longer reach 18/20 |
+| Data collection, training shoes | `d70c650`-`be473e9` | 7 successes of 13 episodes (failed episodes are not kept) |
+| `tools/check_dataset.py` on mini-gate output | | 5/5 episodes load through `AlohaPackedPCDataset`/`Frames` (after allowing shoes hidden in a closed box at the end of a success) |
+| Video | | `docs/media/t1_scripted_success.mp4` (front, overhead, right wrist; scripted success, seed 1000) |
+
+**Phase 4, round 1 (ran; result: no success).** ACT and Diffusion Policy trained 20k steps each on 13 successful training-shoe episodes (8421 samples, seed 0; train L1 0.017 / denoising MSE 0.0037). Closed-loop on held-out shoes: ACT **0/3**, Diffusion Policy **0/2** (evaluations stopped early to free the machine for data collection). ACT barely moves from where it is (with the previous command as input it learned to repeat it, the "copycat" failure); Diffusion Policy did pinch the lid tab and lift the lid to 30 deg once, then lost it. Round 2 adds image augmentation and drops/noises the proprio input, and trains on more data.
