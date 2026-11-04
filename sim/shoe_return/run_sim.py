@@ -45,6 +45,8 @@ parser.add_argument("--grip-close", type=float, default=None, help="finger_joint
 parser.add_argument("--grip-stiffness", type=float, default=None, help="override the 2F-85 finger_joint drive stiffness")
 parser.add_argument("--policy", default=None, help="evaluate a trained policy checkpoint (policy/train.py) instead of the scripted expert")
 parser.add_argument("--no-write", action="store_true", help="do not write episode files (policy evaluation)")
+parser.add_argument("--mimic-record", default=None, help="record scripted source demos for Isaac Lab Mimic into this .hdf5 "
+                    "(runs the expert inside mimic/shoe_return_mimic_env.py; successful episodes only, datagen-annotated)")
 parser.add_argument("--video", default=None, help="write the overhead camera of every episode to <dir>/episode_<E>.mp4")
 add_launcher_args(parser)
 args = parser.parse_args()
@@ -927,6 +929,8 @@ def main():
         import scene as S
 
         T_W3_TCP = S.T_W3_GB @ S.T_GB_TCP
+        if args.mimic_record:
+            return mimic_record()
         from isaaclab.utils import instantiate
 
         from repack_scene import make_scene_cfg
@@ -1088,6 +1092,110 @@ def check_sphere_model(arms, robots, recorder):
         worst.sort(reverse=True)
         print(f"[check {side}] link-centre distance outside the sphere model, worst: "
               + ", ".join(f"{n} {d * 100:.1f}cm" for d, n in worst[:4]), flush=True)
+
+
+def mimic_record():
+    """Run the scripted expert inside the Isaac Lab Mimic env and keep its successful episodes as Mimic source demos.
+    The expert plans exactly as in main(); instead of writing joint targets itself it sends its TCP targets and gripper
+    commands as env actions (the env's action term does the same IK). Datagen annotations (eef/object poses, subtask
+    signals) are recorded on the fly."""
+    import gymnasium as gym
+    import torch
+
+    import isaaclab.utils.math as PoseUtils
+    from isaaclab.managers import DatasetExportMode
+
+    sys.path.insert(0, str(HERE / "mimic"))
+    import shoe_return_mimic_env as M
+
+    out = Path(args.mimic_record).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.random.seed(args.seed)
+    M.configure(shoe=args.shoe, cache=str(out.parent / "_mimic_assets"), cameras=False)
+    M.register()
+    cfg = M.ShoeReturnMimicEnvCfg()
+    cfg.scene.num_envs = 1
+    cfg.sim.device = args.device or "cuda:0"
+    cfg.recorders = M.ShoeMimicRecorderManagerCfg()
+    cfg.recorders.dataset_export_dir_path = str(out.parent)
+    cfg.recorders.dataset_filename = out.stem
+    cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
+    cfg.terminations.time_out = None
+    cfg.terminations.success = None
+    env = gym.make(M.TASK_ID, cfg=cfg).unwrapped
+    env.reset()
+    scene, meta = env.scene, cfg.shoe_meta
+    robots = {"left": scene["robot_left"], "right": scene["robot_right"]}
+    arms = {side: Arm(side, r, env.device) for side, r in robots.items()}
+    arms["right"].pinch_open = meta["open"]
+    for arm in arms.values():
+        arm.calibrate_kinematics()
+    cell = Cell(scene, meta)
+    for arm in arms.values():
+        arm.cell = cell
+    origin = scene.env_origins[0].cpu().numpy()
+
+    def action():
+        a = []
+        for side in ("left", "right"):
+            arm = arms[side]
+            q = PoseUtils.quat_from_matrix(torch.tensor(arm.R, dtype=torch.float32)[None])[0].tolist()
+            a += [*(arm.p - origin), *q, float(arm.grip)]
+        return torch.tensor([a], dtype=torch.float32, device=env.device)
+
+    n_ok = 0
+    for ep in range(args.start_episode, args.start_episode + args.episodes):
+        t0 = time.time()
+        if ep > args.start_episode:
+            env.recorder_manager.reset()
+            env.reset()
+        for arm in arms.values():
+            arm.reset()
+        lid = Lid(cell, None)
+
+        def transit_scene(arm, lid=lid):
+            other = arms["left" if arm.side == "right" else "right"]
+            att = other.attached()
+            others = [other.spheres_at(other.joint_pos(), att)]
+            if isinstance(other.move, MoveJ):
+                others += [other.spheres_at(q, att) for q in other.move.path]
+            return collision.Scene(boxes=lid.obstacles(), table_z=S.TABLE_Z, others=others)
+
+        for arm in arms.values():
+            arm.transit_scene = transit_scene
+        for _ in range(120):  # settle at home
+            for arm in arms.values():
+                arm.plan_step()
+            env.step(action())
+        phases, k, dropped, phase_name = script(cell, lid), 0, False, "setup"
+        while k < args.max_steps:
+            if all(a.idle for a in arms.values()):
+                if not phases:
+                    break
+                phase_name, moves = phases.pop(0)
+                for side, m in moves.items():
+                    arms[side].queue.extend(m)
+            for arm in arms.values():
+                arm.plan_step()
+            env.step(action())
+            if args.debug and k % 600 == 0:
+                print(f"[mimic-rec k={k} {phase_name}] hinge {cell.hinge_deg():.0f} heel z {grasp_point(cell, 0)[2]:.3f}/{grasp_point(cell, 1)[2]:.3f}"
+                      f" signals {({n: int(v[0]) for n, v in env.get_subtask_term_signals().items()})}", flush=True)
+            if any(cell.shoe_pose(i)[2, 3] < S.TABLE_Z - 0.05 for i in range(2)):
+                dropped = True
+                break
+            k += 1
+        for _ in range(60):
+            env.step(action())
+        ok = (not phases and not dropped and bool(M.task_success(env)[0]))
+        env.recorder_manager.record_pre_reset([0], force_export_or_skip=False)
+        env.recorder_manager.set_success_to_episodes([0], torch.tensor([[ok]], dtype=torch.bool, device=env.device))
+        env.recorder_manager.export_episodes([0])
+        n_ok += ok
+        print(f"[mimic-rec ep {ep}] {'ok' if ok else 'FAILED'} hinge {cell.hinge_deg():.1f} in_box {[shoe_in_box(cell, i) for i in range(2)]} "
+              f"({k} steps, {time.time() - t0:.0f}s); {n_ok} source demos so far", flush=True)
+    print(f"[mimic-rec] {n_ok}/{args.episodes} successful episodes exported to {out}", flush=True)
+    env.close()
 
 
 def fix_shoe_prims():

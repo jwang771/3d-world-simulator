@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shoe Cell VR</title>
+<style>
+  :root { --bg: #111418; --fg: #e8eaed; --muted: #9aa0a6; --ok: #5bd17a; --warn: #f2b84b; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #hud { position: absolute; top: 12px; left: 16px; right: 16px; pointer-events: none; }
+  #hud h1 { font-size: 18px; margin: 0 0 4px; }
+  #status { color: var(--muted); white-space: pre-line; }
+  #help { position: absolute; bottom: 72px; left: 16px; right: 16px; color: var(--muted); font-size: 13px; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); }
+</style>
+<script type="importmap">{ "imports": { "three": "/static/vendor/three.module.min.js" } }</script>
+</head>
+<body>
+<div id="hud"><h1>Shoe-return cell</h1><div id="status">connecting…</div></div>
+<div id="help">Enter VR, then: hold <b>grip</b> to move an arm with your hand · <b>trigger</b> closes the gripper ·
+<b>A/X</b> open width full/pinch · <b>B</b> finish episode (saved if both shoes are in and the lid is shut) · <b>Y</b> discard and reset</div>
+<script type="module">
+import * as THREE from "three";
+import { VRButton } from "/static/vendor/VRButton.js";
+
+// ---- renderer and scene
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType("local-floor");
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x202428);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 50);
+camera.position.set(0, 1.6, 0);
+camera.layers.enable(1);  // desktop preview shows the left-eye image
+addEventListener("resize", () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+// ---- stereo video panel: the sim renders one camera per eye; three.js shows layer 1 to the left eye, layer 2 to the right
+// Sized so it covers the sim camera's field of view (60.4 deg horizontal) at 1 m: objects appear life size.
+const PANEL_DIST = 1.0, HFOV = 2 * Math.atan(10.4775 / 18.0);
+const panelW = 2 * PANEL_DIST * Math.tan(HFOV / 2), panelH = panelW * 0.75;
+const panel = new THREE.Group();
+scene.add(panel);
+const eyes = [0, 1].map((i) => {
+  const canvas = document.createElement("canvas");
+  canvas.width = 640; canvas.height = 480;
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(panelW, panelH), new THREE.MeshBasicMaterial({ map: tex, toneMapped: false }));
+  mesh.layers.set(i + 1);
+  panel.add(mesh);
+  return { canvas, ctx: canvas.getContext("2d"), tex };
+});
+panel.position.set(0, 1.6, -PANEL_DIST);
+
+// status panel under the video, both eyes
+const statusCanvas = document.createElement("canvas");
+statusCanvas.width = 1024; statusCanvas.height = 128;
+const statusTex = new THREE.CanvasTexture(statusCanvas);
+const statusMesh = new THREE.Mesh(new THREE.PlaneGeometry(panelW, panelW / 8), new THREE.MeshBasicMaterial({ map: statusTex, transparent: true }));
+statusMesh.position.set(0, -panelH / 2 - panelW / 16 - 0.02, 0);
+panel.add(statusMesh);
+
+function drawStatus(lines) {
+  const c = statusCanvas.getContext("2d");
+  c.clearRect(0, 0, 1024, 128);
+  c.fillStyle = "rgba(17,20,24,0.85)"; c.fillRect(0, 0, 1024, 128);
+  c.fillStyle = "#e8eaed"; c.font = "34px system-ui, sans-serif";
+  lines.forEach((l, i) => c.fillText(l, 20, 48 + i * 48));
+  statusTex.needsUpdate = true;
+}
+
+// controller markers
+for (let i = 0; i < 2; i++) {
+  const g = renderer.xr.getControllerGrip(i);
+  g.add(new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, 0.08), new THREE.MeshBasicMaterial({ color: 0x6aa8ff })));
+  scene.add(g);
+}
+
+// put the panel 1 m in front of the head when VR starts
+let placePanel = false;
+renderer.xr.addEventListener("sessionstart", () => { placePanel = true; camera.layers.disable(1); });
+renderer.xr.addEventListener("sessionend", () => { camera.layers.enable(1); panel.position.set(0, 1.6, -PANEL_DIST); panel.rotation.set(0, 0, 0); });
+
+// ---- connection to the sim
+const statusEl = document.getElementById("status");
+let ws, last = {}, frames = 0, fps = 0, tFps = performance.now();
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { statusEl.textContent = "connected, waiting for frames…"; };
+  ws.onclose = () => { statusEl.textContent = "disconnected, retrying…"; setTimeout(connect, 1000); };
+  ws.onmessage = async (m) => {
+    if (typeof m.data === "string") { last = JSON.parse(m.data); return; }
+    const eye = new Uint8Array(m.data, 0, 1)[0];
+    const bmp = await createImageBitmap(new Blob([new Uint8Array(m.data, 1)], { type: "image/jpeg" }));
+    const e = eyes[eye];
+    e.ctx.drawImage(bmp, 0, 0, e.canvas.width, e.canvas.height);
+    e.tex.needsUpdate = true;
+    if (eye === 0) frames++;
+  };
+}
+connect();
+
+function statusLines() {
+  const ok = last.success ? "TASK DONE - press B to save" : "task not done";
+  return [
+    `episode ${last.episode ?? "-"}  saved ${last.saved ?? 0}  lid ${last.lid_deg ?? "-"} deg  ${ok}`,
+    `sim speed ${last.sim_speed ?? "-"}x real time  video ${fps.toFixed(0)} fps  clutch L ${last.clutch?.left ? "ON" : "off"} R ${last.clutch?.right ? "ON" : "off"}`,
+  ];
+}
+
+// ---- controllers -> sim (about 30 Hz)
+let tSend = 0;
+function sendControllers(frame) {
+  const now = performance.now();
+  if (!ws || ws.readyState !== 1 || now - tSend < 33) return;
+  tSend = now;
+  const ref = renderer.xr.getReferenceSpace();
+  const hands = {};
+  for (const src of frame.session.inputSources) {
+    if (!src.gripSpace || !src.gamepad || (src.handedness !== "left" && src.handedness !== "right")) continue;
+    const pose = frame.getPose(src.gripSpace, ref);
+    if (!pose) continue;
+    const t = pose.transform, b = src.gamepad.buttons;
+    hands[src.handedness] = {
+      p: [t.position.x, t.position.y, t.position.z],
+      q: [t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w],
+      trigger: b[0]?.value ?? 0, squeeze: b[1]?.value ?? 0, a: !!b[4]?.pressed, b: !!b[5]?.pressed,
+    };
+  }
+  ws.send(JSON.stringify({ hands }));
+}
+
+renderer.setAnimationLoop((time, frame) => {
+  const now = performance.now();
+  if (now - tFps > 1000) {
+    fps = frames * 1000 / (now - tFps); frames = 0; tFps = now;
+    const lines = statusLines();
+    statusEl.textContent = lines.join("\n");
+    drawStatus(lines);
+  }
+  if (frame) {
+    if (placePanel) {
+      const xrCam = renderer.xr.getCamera();
+      const p = new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld);
+      if (p.lengthSq() > 0) {
+        panel.position.set(p.x, p.y, p.z - PANEL_DIST);
+        placePanel = false;
+      }
+    }
+    sendControllers(frame);
+  }
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>

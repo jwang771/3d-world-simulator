@@ -173,3 +173,15 @@ The phase order in the master prompt was not followed strictly: Phase 4 code was
 5. Retrain ACT and Diffusion Policy. Consider sub-task conditioning (open lid / place / close) and closed-loop proprio from measured joints rather than commands.
 
 **2026-11-04 09:50: build tools installed by the user; Mimic installed (ran and passed).** `uv sync --extra isaacsim --extra rsl-rl --extra video --extra mimic` built `egl-probe` 1.0.2 from source and installed `isaaclab-mimic` 2.0.12, `isaaclab-teleop` 0.10.3 and `robomimic` 0.4.0 (pinned by Isaac Lab's `uv.lock` at `e3f7d9f`). `isaaclab_mimic` imports under Kit, and the shoe sim still runs (pick probe: shoe held at 0.345 m). Not yet used: Mimic generates data only for tasks written as an Isaac Lab `ManagerBasedRLMimicEnv`, and `run_sim.py` is a standalone script.
+
+**2026-11-04 afternoon: shoe task as an Isaac Lab Mimic env (ran).** `sim/shoe_return/mimic/shoe_return_mimic_env.py` registers `Isaac-ShoeReturn-T1-Mimic-v0`. Its action is an absolute TCP pose plus gripper level per arm, tracked by the same calibrated IK as the expert. There are four right-arm subtasks (grasp, place, grasp, place) and two left-arm subtasks (open, close), with sequential constraints between the arms.
+- **Source demos:** `run_sim.py --mimic-record` runs the expert inside the env. Results: 1/1 successful, then 4/6 (SUPERSTAR_CLR).
+- **Generation:** `tools/mimic_generate.py`.
+  - From the 1 source demo: 0/3 successful. The right arm stalled holding shoe 2 next to the box.
+  - From the 4 source demos: **2/4 successful generated demos** (`gen4.hdf5`).
+- **Replay:** `tools/mimic_replay_video.py` replays a demo's actions open loop with cameras on. Both generated demos put both shoes in the box but **leave the lid open on replay** (task success False). The replay is not deterministic, so it diverges from the generation run at the lid regrasp. Videos are in `runs/mimic/videos/` (not committed).
+
+**2026-11-04: VR teleop from a Meta Quest 3 browser (ran with a simulated headset client only).** `sim/shoe_return/vr/teleop_server.py` runs the Mimic env with a stereo camera pair at the operator's eye position. It serves `vr/web/index.html` (three.js 0.160.0, MIT, vendored) over HTTP on :8080 for USB with `adb reverse`, and over HTTPS on :8443 with a self-signed certificate for Wi-Fi. A WebSocket streams JPEG frames per eye and receives controller poses. Grip is a clutch, the trigger closes the gripper, B saves the episode as a Mimic source demo if the task is done, and Y discards it.
+- **Measured with a scripted WebSocket client:** a 0.15 m forward hand motion moved the right TCP by +0.150 m in y, with 0.032 m drift in x. Both eye streams arrived.
+- **Limitation:** the sim runs at **0.29x real time**, with about 4 video fps per eye. Teleop is in slow motion.
+- **Not yet tried on a real Quest 3.** Plan: `docs/VR_TRAINING_WORLD.md`.
