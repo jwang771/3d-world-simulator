@@ -129,9 +129,11 @@ def make_scene_cfg(assets, width, height, wrist_cams=True, num_envs=1):
             fix_root_link=True,  # the box sits in a nest/jig on the table
             rigid_props=_OBJECT_PHYSX,
             articulation_props=[PhysxArticulationCfg(enabled_self_collisions=False, solver_position_iteration_count=16, solver_velocity_iteration_count=1)],
+            # Tight contact offset: with the default, the closing lid's skirt "landed" on the wall top a few mm early
+            # and the lid stopped at 16-19 deg.
+            collision_props=PhysxCollisionCfg(contact_offset=0.002, rest_offset=0.0),
         ),
         init_state=ArticulationCfg.InitialStateCfg(pos=(*S.BOX_NOMINAL["center"], S.TABLE_Z), joint_pos={"lid_hinge": 0.0}),
-        # Cardboard hinge: enough damping that a released lid settles rather than slams (lid gravity torque <= 0.2 Nm).
         # A creased paperboard hinge stays roughly where it is left: static (Coulomb) friction 0.06 N m holds a released
         # lid anywhere above ~70 deg (lid weight torque 0.19 N m flat, ~0.03 N m at 80 deg), while a closed lid stays
         # closed and the arm overcomes it easily. (Frictionless, an open lid crept or was knocked shut.)
