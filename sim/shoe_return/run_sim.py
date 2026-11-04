@@ -571,7 +571,7 @@ class Placement:
     def descend(self):
         """Quickly to 8 cm above the resting height, then slowly down onto the floor."""
         return [Move(lambda arm: (np.array([arm.p[0], arm.p[1], self.rest_tcp_z() + 0.08]), arm.R), speed=0.15),
-                Move(lambda arm: (np.array([arm.p[0], arm.p[1], self.rest_tcp_z()]), arm.R), speed=0.05)]
+                Move(lambda arm: (np.array([arm.p[0], arm.p[1], self.rest_tcp_z()]), arm.R), speed=0.03)]
 
 
 class Lid:
@@ -711,7 +711,7 @@ class Lid:
 
 def script(cell, lid):
     """Phases; each is (name, {side: [Move]}) and the next starts once both arms are idle."""
-    half_gap = cell.meta["width"] / 2 + 0.01  # each shoe centred in its half of the box (see scene.size_box_for)
+    half_gap = cell.meta["width"] / 2 + 0.015  # each shoe centred in its half of the box (see scene.size_box_for)
     place1 = Placement(cell, 0, ((0.0, -half_gap), np.pi))  # toe toward -x
     place2 = Placement(cell, 1, ((0.0, half_gap), 0.0))  # toe toward +x: heel-to-toe
     def pick(k, retries=2):
