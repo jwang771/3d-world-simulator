@@ -33,17 +33,23 @@ parser.add_argument("--height", type=int, default=480)
 parser.add_argument("--record-every", type=int, default=8, help="physics steps (120 Hz) per recorded frame")
 parser.add_argument("--no-wrist-cams", dest="wrist_cams", action="store_false")
 parser.add_argument("--keep-failures", action="store_true", help="also write episodes that fail the success check")
-parser.add_argument("--max-steps", type=int, default=12000)
+parser.add_argument("--max-steps", type=int, default=16000)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--grasp", default="collar", choices=["collar", "clamp"], help="shoe grasp: collar pinch or whole-heel clamp")
 parser.add_argument("--shoe", default="random", help="scanned shoe model name from the library, 'random', or 'procedural'")
 parser.add_argument("--debug", action="store_true", help="print TCP tracking error twice a second")
+parser.add_argument("--skill", default=None, choices=["pick", "carry"], help="debug: run one skill instead of the task (pick: lift shoe 0 and hold it; carry: also swing it over the box and back)")
+parser.add_argument("--grasp-depth", type=float, default=0.015, help="lower the shoe grasp point by this much (m) so the pads cover the heel counter, not just the collar edge")
+parser.add_argument("--grip-effort", type=float, default=None, help="override the 2F-85 finger_joint effort limit (Nm)")
+parser.add_argument("--grip-close", type=float, default=None, help="finger_joint close target (rad); default S.GRIP_CLOSED")
+parser.add_argument("--grip-stiffness", type=float, default=None, help="override the 2F-85 finger_joint drive stiffness")
 parser.add_argument("--video", default=None, help="write the overhead camera of every episode to <dir>/episode_<E>.mp4")
 add_launcher_args(parser)
 args = parser.parse_args()
 
 import numpy as np  # noqa: E402
 
+import collision  # noqa: E402
 import ur_kin  # noqa: E402
 from geometry import mat_to_quat, mat_to_rotvec, pose, quat_to_mat, rot_x, rot_z, slerp_mat, tcp_yaw, top_down, wrap  # noqa: E402
 
@@ -52,6 +58,15 @@ HOME = {"left": np.array([-0.45, 0.02, 0.35]), "right": np.array([0.40, 0.02, 0.
 RIGHT_WAIT = np.array([0.30, -0.18, 0.30])
 LID_OPEN_DEG = 100.0  # past vertical: the lid then rests open on its 105 deg stop by itself
 LID_CLOSED_DEG = 2.0
+CARRY_JOINT_SPEED = 0.45  # rad/s, joint-space speed with a shoe in hand (at 0.9 a heel-held shoe was flung out)
+LID_BUFFER = 0.05  # m, extra clearance around the lid for collision-checked transits
+TOE_SHIFT = 0.02  # m, a placed shoe sits this far toward its toe from the box's centre line
+# A heel-held shoe hangs toe-down, its toe up to a shoe length (~0.3 m) below the hand: lift and carry high enough
+# that it clears the box walls (a toe that caught the box corner knocked the shoe out of the fingers).
+LIFT = 0.35  # m, lift after the grasp
+CARRY_DZ = 0.35  # m, TCP above the rim when the shoe arrives over the box
+MAX_CORRECTION = 0.08  # m, largest closed-loop placement correction
+HELD_DIST = 0.06  # m, grasp point within this of the TCP counts as still held
 ARM_CLEARANCE = 0.12  # wrist-to-wrist distance below which the episode counts as an arm collision
 S = None  # scene.py imports pxr, which must load after Kit's own USD libraries (see main)
 T_W3_TCP = None
@@ -103,7 +118,8 @@ def prepare_assets(cache, rng, shoe="random"):
             meta = dict(name=name, grasp_local=m["heel_grasp"], closing_axis="y",
                         open=S.finger_angle_for_gap(min(0.085, m["heel_width"] + 0.025)))
         else:
-            meta = dict(name=name, grasp_local=m["grasp"], closing_axis="x", open=S.finger_angle_for_gap(m["pinch_open_width"]))
+            meta = dict(name=name, grasp_local=(np.asarray(m["grasp"]) - [0, 0, args.grasp_depth]).tolist(), closing_axis="x",
+                        open=S.finger_angle_for_gap(m["pinch_open_width"]))
         meta.update(length=m["length"], width=m["width"], height=m["height"], mass=m["mass"])
     S.size_box_for(meta["length"], meta["width"], meta["height"])
     S.write_shoebox_usd(out["shoebox"], rng)
@@ -198,6 +214,7 @@ class Arm:
         self.jac_idx = self.w3 - 1 if robot.is_fixed_base else self.w3
         self.k0 = robot.data.joint_stiffness.torch[:, self.joint_ids].clone()
         self.d0 = robot.data.joint_damping.torch[:, self.joint_ids].clone()
+        self.cell = None
         self.ik = DifferentialIKController(DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"), num_envs=1, device=device)
         self.reset()
 
@@ -254,6 +271,56 @@ class Arm:
             print(f"[kin {self.side}] no valid IK within joint limits (residual {res:.3f}) for target {np.round(p, 3)}", flush=True)
         return q
 
+    def held_shoe(self):
+        """Index of the shoe in this hand (grip closed and its grasp point at the TCP), else None."""
+        if self.grip >= 0.5 or self.cell is None:
+            return None
+        tcp = self.tcp()[:3, 3]
+        d = [np.linalg.norm(grasp_point(self.cell, k) - tcp) for k in range(2)]
+        return int(np.argmin(d)) if min(d) < HELD_DIST else None
+
+    def attached(self):
+        """Spheres along the held shoe's length, in the TCP frame at its current, measured pose in the hand."""
+        k = self.held_shoe()
+        if k is None:
+            return None
+        m = self.cell.meta
+        T = np.linalg.inv(self.tcp()) @ self.cell.shoe_pose(k)
+        xs = np.linspace(-m["length"] / 2 + 0.04, m["length"] / 2 - 0.04, 5)
+        pts = [(T @ [x, 0.0, 0.45 * m["height"], 1.0])[:3] for x in xs]
+        return np.array(pts), 0.55 * max(m["width"], m["height"])
+
+    def spheres_at(self, q, attached=None):
+        A, B = self.kin
+        return collision.arm_spheres(self.root_pose() @ A, q, B @ T_W3_TCP, S.ROBOT_MODEL, attached=attached)
+
+    def plan_transit(self, q0, q1, p1, R1):
+        """Joint waypoints to q1 that keep this arm clear of the table, the box, the lid and the other arm. Falls back
+        to the straight path (and says so) if no clear path is found."""
+        scene = self.transit_scene(self)
+        att = self.attached()
+        spheres_at = lambda q: self.spheres_at(q, att)
+        if collision.path_hit(spheres_at, scene, q0, q1) is None:
+            return [q1]
+        p0, R0 = self.tcp()[:3, 3], self.tcp()[:3, :3]
+        vias = []
+        for p, R, seed in ((p0, R0, q0), (p1, R1, q1)):
+            # Low detours first: the same height, pulled toward the robot (around the open box side, away from the
+            # lid); then raised ones. A shoe swung over a high via fell out of the pinch.
+            inward = np.append(self.base_pos[:2] - p[:2], 0.0)
+            inward /= max(np.linalg.norm(inward), 1e-6)
+            for d in (0.12, 0.22):
+                vias.append(self.solve_ik(p + inward * d, R, seed))
+            for z in (0.45, 0.60, 0.70):
+                vias.append(self.solve_ik(np.array([p[0], p[1], max(p[2], z)]), R, seed))
+        vias.append(self.solve_ik(HOME[self.side] + [0, 0, 0.10], top_down(self.comfy(self.base_yaw)), q0))
+        path = collision.plan(spheres_at, scene, q0, q1, vias=vias, rng=np.random.default_rng(len(vias)))
+        if path is None:
+            print(f"[plan {self.side}] no collision-free transit to {np.round(p1, 3)} "
+                  f"(direct path hits {collision.path_hit(spheres_at, scene, q0, q1)}); moving directly", flush=True)
+            return [q1]
+        return path
+
     def w3_pose(self):
         d = self.robot.data.body_pose_w.torch[0, self.w3].cpu().numpy()
         return pose7(d[:3], d[3:])
@@ -274,12 +341,15 @@ class Arm:
         if isinstance(self.move, MoveJ):
             m = self.move
             m.k += 1
-            s = min(1.0, m.k / m.dur)
+            a, b, dur = m.segs[m.i]
+            s = min(1.0, m.k / dur)
             s = s * s * (3 - 2 * s)
-            self.q_cmd = m.q0 + (m.q1 - m.q0) * s
+            self.q_cmd = a + (b - a) * s
             T = self.model_tcp(self.q_cmd)
             self.p, self.R = T[:3, 3], T[:3, :3]
-            if m.k >= m.dur + 30:
+            if m.k >= dur and m.i + 1 < len(m.segs):
+                m.i, m.k = m.i + 1, 0
+            elif m.k >= dur + 30:
                 self.q_cmd, self.move = None, None
                 self.p, self.R = m.p1, m.R1
             return
@@ -316,11 +386,14 @@ class Arm:
                 self.grip = m.grip
             m.q0 = self.joint_pos()
             m.q1 = self.solve_ik(m.p1, m.R1, m.q0)
-            m.dur = int(max(m.min_steps, np.abs(m.q1 - m.q0).max() / m.joint_speed * PHYSICS_HZ))
+            m.path = self.plan_transit(m.q0, m.q1, m.p1, m.R1)
+            pts = [m.q0, *m.path]
+            speed = m.joint_speed if self.held_shoe() is None else min(m.joint_speed, CARRY_JOINT_SPEED)
+            m.segs = [(a, b, int(max(m.min_steps, np.abs(b - a).max() / speed * PHYSICS_HZ))) for a, b in zip(pts, pts[1:])]
             if args.debug:
-                print(f"[movej {self.side}] to {np.round(m.p1, 3)} max|dq| {np.rad2deg(np.abs(m.q1 - m.q0).max()):.0f}deg "
+                print(f"[movej {self.side}] to {np.round(m.p1, 3)} via {len(m.path) - 1} max|dq| {np.rad2deg(np.abs(m.q1 - m.q0).max()):.0f}deg "
                       f"q0 {np.round(np.rad2deg(m.q0)).astype(int)} q1 {np.round(np.rad2deg(m.q1)).astype(int)}", flush=True)
-            m.k = 0
+            m.k, m.i = 0, 0
             return self.plan_step()
         if self.move is None and self.queue:
             m = self.move = self.queue.pop(0)
@@ -347,8 +420,7 @@ class Arm:
             self.q_prev = self.q_cmd.copy()
             q = torch.as_tensor(self.q_cmd[None], dtype=torch.float32, device=self.robot.device)
             self.robot.set_joint_position_target_index(target=q, joint_ids=self.joint_ids)
-            g = self.open_pos if self.grip > 0.5 else S.GRIP_CLOSED
-            self.robot.set_joint_position_target_index(target=self.grip_signs * float(g), joint_ids=self.grip_ids)
+            self.apply_grip()
             return
         # Cartesian target -> joints with the calibrated UR model, seeded from the last command so the solution
         # stays on one branch (Isaac's Jacobian DLS veered onto other branches near wrist singularities).
@@ -363,7 +435,10 @@ class Arm:
         self.q_prev = q_t
         q_des = torch.as_tensor(q_t[None], dtype=torch.float32, device=self.robot.device)
         self.robot.set_joint_position_target_index(target=q_des, joint_ids=self.joint_ids)
-        g = self.open_pos if self.grip > 0.5 else S.GRIP_CLOSED
+        self.apply_grip()
+
+    def apply_grip(self):
+        g = self.open_pos if self.grip > 0.5 else (args.grip_close or S.GRIP_CLOSED)
         self.robot.set_joint_position_target_index(target=self.grip_signs * float(g), joint_ids=self.grip_ids)
 
     def action(self):
@@ -425,7 +500,8 @@ class Placement:
 
     def target(self):
         (x, y), yaw = self.xy_yaw
-        return self.cell.box_pose() @ pose(rot_z(yaw), [x, y, S.BOX["wall"] + 0.004])
+        # Shifted toe-ward, leaving room behind the heel for the outer finger (see scene.size_box_for).
+        return self.cell.box_pose() @ pose(rot_z(yaw), [x, y, S.BOX["wall"] + 0.004]) @ pose(np.eye(3), [TOE_SHIFT, 0, 0])
 
     def heel_target(self):
         g = np.asarray(self.cell.meta["grasp_local"], float)
@@ -436,9 +512,14 @@ class Placement:
     def rim_tcp_z(self):
         return self.cell.box_pose()[2, 3] + S.BOX["height"] + S.PAD_BELOW_TCP + 0.012
 
-    def errors(self):
+    def errors(self, cap=None):
+        """Heel position error and yaw error of the held shoe relative to its spot in the box. `cap` bounds the
+        horizontal correction (used for fine alignment, so a shoe lost from the hand cannot send the arm across the cell)."""
         Sh = self.cell.shoe_pose(self.k)
         e = self.heel_target() - grasp_point(self.cell, self.k)
+        n = np.linalg.norm(e[:2])
+        if cap is not None and n > cap:
+            e[:2] *= cap / n
         G = self.target()
         dyaw = wrap(np.arctan2(G[1, 0], G[0, 0]) - np.arctan2(Sh[1, 0], Sh[0, 0]))
         return e, dyaw
@@ -453,7 +534,7 @@ class Placement:
 
     def align(self):
         def goal(arm):
-            e, dyaw = self.errors()
+            e, dyaw = self.errors(cap=MAX_CORRECTION)
             return arm.p + [e[0], e[1], 0.0], rot_z(dyaw) @ arm.R
 
         def done(arm):
@@ -462,8 +543,13 @@ class Placement:
 
         return Track(goal, done, speed=0.06, turn=0.5, timeout=720)
 
+    def rest_tcp_z(self):
+        """TCP height at which the held heel is ~1 cm above the box floor: the shoe then rests flat on its sole and
+        lets go of the fingers cleanly (released while hanging, it stayed hooked on the finger inside the collar)."""
+        return self.cell.box_pose()[2, 3] + S.BOX["wall"] + self.cell.meta["grasp_local"][2] + 0.010
+
     def descend(self):
-        return Move(lambda arm: (np.array([arm.p[0], arm.p[1], self.rim_tcp_z()]), arm.R), speed=0.08)
+        return Move(lambda arm: (np.array([arm.p[0], arm.p[1], self.rest_tcp_z()]), arm.R), speed=0.06)
 
 
 class Lid:
@@ -478,6 +564,19 @@ class Lid:
         Ly = oy + gap + t
         self.Ly, self.skirt = Ly, S.BOX["skirt"]
         self.tab = np.array([0.0, -Ly - S.TAB["depth"] / 2, t - S.TAB["height"] / 2])
+
+    def obstacles(self):
+        """Box base and lid (at the measured hinge angle) as oriented boxes [(T_world, half extents)]."""
+        lx, ly = S.BOX["inner"]
+        w, h, t, sk = S.BOX["wall"], S.BOX["height"], S.BOX["lid_t"], S.BOX["skirt"]
+        ox, oy = lx + 2 * w, ly + 2 * w
+        base = (self.cell.box_pose() @ pose(np.eye(3), [0, 0, h / 2]), np.array([ox / 2, oy / 2, h / 2]))
+        Lx, depth = ox + 2 * (S.BOX["gap"] + t), self.Ly + S.TAB["depth"]
+        # The open lid gets a wide buffer: a hand-held shoe swings, and the real arm lags its planned path. A shoe
+        # brushing the lid tipped it back past vertical and it fell shut.
+        lid = (self.lid_pose(self.cell.hinge_deg()) @ pose(np.eye(3), [0, -depth / 2, (t - sk) / 2]),
+               np.array([Lx / 2, depth / 2, (t + sk) / 2]) + LID_BUFFER)
+        return [base, lid]
 
     def lid_pose(self, deg):
         return self.cell.box_pose() @ pose(np.eye(3), self.hinge) @ pose(rot_x(-np.deg2rad(deg)), [0, 0, 0])
@@ -510,7 +609,7 @@ class Lid:
         T = self.lid_pose(deg) @ self.T_lid_tcp @ pose(np.eye(3), [0, 0, -standoff])
         return T[:3, 3], T[:3, :3]
 
-    def swing(self, to_deg, lead_deg=6.0, tol_deg=3.0):
+    def swing(self, to_deg, lead_deg=12.0, tol_deg=3.0):
         """Swing the held lid toward to_deg by targeting the lid pose a few degrees past the *measured* hinge angle,
         so the arm follows the lid wherever the box actually is instead of dragging it along a fixed arc."""
 
@@ -521,7 +620,8 @@ class Lid:
             T = self.T_hinge0 @ pose(rot_x(-np.deg2rad(now + step)), [0, 0, 0]) @ self.T_lid_tcp
             return T[:3, 3], T[:3, :3]
 
-        return [Track(goal, lambda arm: abs(self.cell.hinge_deg() - to_deg) < tol_deg, speed=0.12, turn=0.6, compliance=0.15)]
+        # Compliance 0.35: soft enough not to drag the box, stiff enough to swing the damped paperboard hinge.
+        return [Track(goal, lambda arm: abs(self.cell.hinge_deg() - to_deg) < tol_deg, speed=0.12, turn=0.6, timeout=4800, compliance=0.35)]
 
     def grasp(self):
         state = {}
@@ -532,7 +632,7 @@ class Lid:
 
             return goal
 
-        return [MoveJ(at(0.08), grip=1.0), Move(at(0.0), speed=0.08), hold(60, 0.0), Branch(self.capture_grasp, list)]
+        return [MoveJ(at(0.10), grip=1.0), Move(at(0.0), speed=0.08), hold(60, 0.0), Branch(self.capture_grasp, list)]
 
     def push_closed(self, lead_deg=8.0, end_deg=3.0):
         """Close an open lid the way a person does: with the fingers closed, press on its outer face near the free
@@ -568,21 +668,41 @@ def script(cell, lid):
     place2 = Placement(cell, 1, ((0.0, half_gap), 0.0))  # toe toward +x: heel-to-toe
     def pick(k, retries=2):
         # Grasp, lift, and if the shoe did not come up with the gripper, open and try again from above.
-        moves = [MoveJ(heel_grasp(cell, k, 0.12), grip=1.0), Move(heel_grasp(cell, k), speed=0.10), hold(60, 0.0), Move(up(0.20), speed=0.2)]
+        moves = [MoveJ(heel_grasp(cell, k, 0.12), grip=1.0), Move(heel_grasp(cell, k), speed=0.10), hold(60, 0.0), Move(up(LIFT), speed=0.2)]
         if retries:
             # A heel-held shoe pivots (toe on the table), so test that the grasped heel came up, not the shoe origin.
             lifted = lambda arm: grasp_point(cell, k)[2] > S.TABLE_Z + cell.meta["grasp_local"][2] + 0.08
             moves.append(Branch(lifted, lambda: [hold(30, 1.0), Move(up(0.10)), home_j(), *pick(k, retries - 1)]))
         return moves
 
-    place = lambda pl: [MoveJ(pl(0.10)), pl.align(), pl.descend(), hold(50, 1.0), Move(up(0.12))]
+    def held(k):
+        # Still between the fingers, or already in the box (a shoe that slipped and landed inside counts as placed;
+        # re-picking it from inside the box only made things worse).
+        return lambda arm: np.linalg.norm(grasp_point(cell, k) - arm.tcp()[:3, 3]) < HELD_DIST or shoe_in_box(cell, k)
+
+    def place(pl, retries=2):
+        # A heel-held shoe creeps out of the pinch if held for long, so it is carried straight in; if it is no longer
+        # between the fingers when the hand arrives over the box, fetch it again before aligning and lowering.
+        def recheck(r):
+            return Branch(held(pl.k), lambda: [hold(30, 1.0), Move(up(0.05)), home_j(), *pick(pl.k), MoveJ(pl(CARRY_DZ)),
+                                               *([recheck(r - 1)] if r > 1 else [])])
+
+        in_hand = lambda arm: np.linalg.norm(grasp_point(cell, pl.k) - arm.tcp()[:3, 3]) < HELD_DIST
+        dropped_in = lambda arm: shoe_in_box(cell, pl.k) and not in_hand(arm)
+        set_down = lambda: [pl.align(), pl.descend(), hold(60, 1.0), Move(up(0.15), speed=0.08)]
+        return [MoveJ(pl(CARRY_DZ)), *([recheck(retries)] if retries else []), Branch(dropped_in, set_down)]
+
+    if args.skill == "pick":
+        return [("pick", {"right": [*pick(0, retries=0), hold(480, 0.0)]})]
+    if args.skill == "carry":
+        return [("carry", {"right": [*pick(0, retries=0), MoveJ(place1(CARRY_DZ)), MoveJ(heel_grasp(cell, 1, 0.25)), hold(240, 0.0)]})]
     return [
         # Left arm pinches the pull tab and swings the lid past vertical; it stays open on its stop, so the arm
-        # lets go and clears the box. Right arm fetches shoe 1 meanwhile.
+        # lets go and clears the box. Right arm waits, empty, above shoe 1 (holding a shoe for long lets it creep out).
         ("open_lid", {"left": [*lid.grasp(), *lid.swing(LID_OPEN_DEG), hold(40, 1.0), Move(back_off(0.08)), home_j()],
-                      "right": [*pick(0), MoveJ(to(RIGHT_WAIT))]}),
+                      "right": [MoveJ(heel_grasp(cell, 0, 0.12), grip=1.0)]}),
         # Long transits go through the home pose (joint space).
-        ("place_shoes", {"right": [*place(place1), home_j(), *pick(1), *place(place2), home_j()]}),
+        ("place_shoes", {"right": [*pick(0), *place(place1), home_j(), *pick(1), *place(place2), home_j()]}),
         # Re-grasp the tab where the lid rests and swing it shut, then let go and clear.
         ("close_lid", {"left": [*lid.grasp(), *lid.swing(LID_CLOSED_DEG), hold(50, 1.0), Move(back_off(0.08)), home_j()]}),
     ]
@@ -688,7 +808,14 @@ def main():
         assets = prepare_assets(Path(args.out) / "_assets", rng, args.shoe)
         sim = sim_utils.SimulationContext(sim_cfg)
         sim.set_camera_view([0.0, -1.6, 1.0], [0.0, -0.1, 0.0])
-        scene = instantiate(make_scene_cfg(assets, args.width, args.height, args.wrist_cams))
+        scene_cfg = make_scene_cfg(assets, args.width, args.height, args.wrist_cams)
+        if args.grip_stiffness is not None:
+            for r in (scene_cfg.robot_left, scene_cfg.robot_right):
+                r.actuators["gripper_drive"].stiffness = args.grip_stiffness
+        if args.grip_effort is not None:
+            for r in (scene_cfg.robot_left, scene_cfg.robot_right):
+                r.actuators["gripper_drive"].joint_effort_limit = args.grip_effort
+        scene = instantiate(scene_cfg)
         fix_robot_prims()
         fix_shoe_prims()
         check_flange_offset()
@@ -699,6 +826,8 @@ def main():
         for arm in arms.values():
             arm.calibrate_kinematics()
         cell = Cell(scene, assets["shoe_meta"])
+        for arm in arms.values():
+            arm.cell = cell
         cam_ids = sorted(int(n.split("_")[1]) for n in scene.keys() if n.startswith("camera_"))
         recorder = Recorder(scene, cam_ids, robots)
         task = TASKS["shoe_return"]
@@ -718,6 +847,17 @@ def main():
             for arm in arms.values():
                 arm.reset()
             lid = Lid(cell, assets["shoebox"])
+
+            def transit_scene(arm, lid=lid):
+                other = arms["left" if arm.side == "right" else "right"]
+                att = other.attached()
+                others = [other.spheres_at(other.joint_pos(), att)]
+                if isinstance(other.move, MoveJ):
+                    others += [other.spheres_at(q, att) for q in other.move.path]
+                return collision.Scene(boxes=lid.obstacles(), table_z=S.TABLE_Z, others=others)
+
+            for arm in arms.values():
+                arm.transit_scene = transit_scene
             for _ in range(240):  # settle, arms to home, renderer warm-up
                 for arm in arms.values():
                     arm.plan_step()
@@ -725,6 +865,7 @@ def main():
             if ep == args.start_episode:
                 for arm in arms.values():
                     assert arm.check_kinematics() < 0.005, "DH model does not match the simulated arm"
+                check_sphere_model(arms, robots, recorder)
 
             split = "val" if args.val_every and ep % args.val_every == 0 else "train"
             writer = EpisodeWriter(out, split, ep, cam_ids, task)
@@ -749,7 +890,8 @@ def main():
                     print(f"[dbg k={k} {phase_name}] tcp err L {errs['left']*100:.1f}cm/{rerr['left']:.0f}deg R {errs['right']*100:.1f}cm/{rerr['right']:.0f}deg "
                           f"hinge {cell.hinge_deg():.0f} box {np.round(cell.box_pose()[:3, 3], 3)} "
                           f"fingers L {np.rad2deg(robots['left'].data.joint_pos.torch[0, arms['left'].finger_id].item()):.0f} "
-                          f"R {np.rad2deg(robots['right'].data.joint_pos.torch[0, arms['right'].finger_id].item()):.0f}deg", flush=True)
+                          f"R {np.rad2deg(robots['right'].data.joint_pos.torch[0, arms['right'].finger_id].item()):.0f}deg "
+                          f"heel z {grasp_point(cell, 0)[2]:.3f}/{grasp_point(cell, 1)[2]:.3f}", flush=True)
                 if record:
                     frames = recorder.frames()
                     robot_boxes, grip_boxes = recorder.label_boxes()
@@ -780,6 +922,20 @@ def main():
         print(f"success {n_ok}/{len(stats)}")
         out.mkdir(parents=True, exist_ok=True)
         (out / f"run_stats_seed{args.seed}_ep{args.start_episode}.json").write_text(json.dumps(stats, indent=1))
+
+
+def check_sphere_model(arms, robots, recorder):
+    """Each simulated link's bounding-box centre should lie inside (or within a few cm of) the collision spheres."""
+    for side, arm in arms.items():
+        c, r = arm.spheres_at(arm.joint_pos())
+        bp = robots[side].data.body_pose_w.torch[0].cpu().numpy()
+        worst = []
+        for i, _, cen, half in recorder.boxes[side]:
+            x = (pose7(bp[i, :3], bp[i, 3:]) @ np.append(cen, 1.0))[:3]
+            worst.append((float(np.min(np.linalg.norm(c - x, axis=1) - r)), robots[side].body_names[i]))
+        worst.sort(reverse=True)
+        print(f"[check {side}] link-centre distance outside the sphere model, worst: "
+              + ", ".join(f"{n} {d * 100:.1f}cm" for d, n in worst[:4]), flush=True)
 
 
 def fix_shoe_prims():

@@ -90,7 +90,7 @@ def main():
     hi_b = np.array([t["x_range"][1], t["y_range"][1], t["z_range"][1]])
     rx, ry = S.SHOE_REGION["x"], S.SHOE_REGION["y"]
     assert lo_b[0] <= rx[0] and rx[1] <= hi_b[0] and lo_b[1] <= ry[0] and ry[1] <= hi_b[1]
-    for deg in (0, 105):
+    for deg in (0, S.BOX["open_limit"]):
         for T_box in (S.box_pose_from_nominal(np.random.default_rng(k)) for k in range(50)):
             p = (lid_pose(box, T_box, deg) @ np.append(box.tab_in_lid, 1))[:3]
             assert np.all(p > lo_b) and np.all(p < hi_b), (deg, p)

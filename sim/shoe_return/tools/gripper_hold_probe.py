@@ -16,6 +16,10 @@ from isaaclab.app import add_launcher_args, launch_simulation  # noqa: E402
 parser = argparse.ArgumentParser()
 parser.add_argument("--strip", action="store_true", help="strip the 2F-85's nested articulation root first")
 parser.add_argument("--close", type=float, default=0.6, help="finger_joint target when closed (rad)")
+parser.add_argument("--mode", default="finger", choices=["finger", "commanded", "measured"],
+                    help="linkage joint targets: held at start (finger), sign * close (commanded), sign * measured finger angle")
+parser.add_argument("--drive-right", action="store_true", help="drive right_outer_knuckle_joint like finger_joint on our UR10e")
+parser.add_argument("--finger-stiffness", type=float, default=None, help="override the inner-finger (mimic) joint drive on our UR10e")
 add_launcher_args(parser)
 args = parser.parse_args()
 
@@ -52,6 +56,12 @@ def main():
             theirs = nv
 
         cfg = ProbeCfg(num_envs=1, env_spacing=4.0)
+        if args.drive_right:
+            from repack_scene import drive_both_knuckles
+            drive_both_knuckles(cfg.c)
+        if args.finger_stiffness is not None:
+            cfg.c.actuators["gripper_finger"].stiffness = args.finger_stiffness
+            cfg.c.actuators["gripper_finger"].damping = 0.0 if args.finger_stiffness == 0 else cfg.c.actuators["gripper_finger"].damping
         cfg.a.prim_path, cfg.b.prim_path, cfg.c.prim_path = "{ENV_REGEX_NS}/A", "{ENV_REGEX_NS}/B", "{ENV_REGEX_NS}/C"
         cfg.a.init_state.pos, cfg.b.init_state.pos, cfg.c.init_state.pos = (-1.5, 0, 0), (0, 1.5, 0), (0, -1.5, 0)
         sim = sim_utils.SimulationContext(sim_cfg)
@@ -79,10 +89,17 @@ def main():
         hold = {k: r.data.joint_pos.torch.clone() for k, r in robots.items()}
         fj = {k: r.find_joints(["finger_joint"])[0] for k, r in robots.items()}
         w3 = {k: r.find_joints(["wrist_3_joint"])[0] for k, r in robots.items()}
+        signs = dict(finger_joint=1, right_outer_knuckle_joint=1, left_inner_finger_joint=-1, right_inner_finger_joint=1,
+                     left_inner_finger_knuckle_joint=-1, right_inner_finger_knuckle_joint=-1)
+        link = {k: (r.find_joints(list(signs), preserve_order=True)[0], torch.tensor(list(signs.values()), dtype=torch.float32, device=r.device)) for k, r in robots.items()}
         for k in range(720):
             for name, r in robots.items():
                 tgt = hold[name].clone()
                 if k >= 120:
+                    ids, sg = link[name]
+                    if args.mode != "finger":
+                        now = r.data.joint_pos.torch[0, fj[name][0]].item()
+                        tgt[0, ids] = sg * (args.close if args.mode == "commanded" else now)
                     tgt[:, fj[name]] = args.close
                 r.set_joint_position_target_index(target=tgt)
             scene.write_data_to_sim()
@@ -92,7 +109,7 @@ def main():
                 line = []
                 for name, r in robots.items():
                     q = r.data.joint_pos.torch[0].cpu().numpy()
-                    line.append(f"{name}: wrist_3 {np.rad2deg(q[w3[name][0]]):8.1f} finger {np.rad2deg(q[fj[name][0]]):6.1f}")
+                    line.append(f"{name}: wrist_3 {np.rad2deg(q[w3[name][0]]):8.1f} finger {np.rad2deg(q[fj[name][0]]):6.1f} links {np.round(np.rad2deg(q[link[name][0][1:]])).astype(int)}")
                 print(f"[hold k={k:3d}{' closed' if k >= 120 else ' open  '}] " + " | ".join(line), flush=True)
 
 

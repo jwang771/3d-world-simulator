@@ -24,7 +24,9 @@ UR_HOME_Q = np.array([0.0, -1.9, 1.9, -1.57, -1.57, 0.0])  # shoulder_pan .. wri
 UR_LIMITS = {"shoulder_pan_joint": (330.0, 2.094), "shoulder_lift_joint": (330.0, 2.094), "elbow_joint": (150.0, np.pi),
              "wrist_1_joint": (56.0, np.pi), "wrist_2_joint": (56.0, np.pi), "wrist_3_joint": (56.0, np.pi)}
 GRIPPER_KEY = "Robotiq_2F_85"  # path component of every 2F-85 prim
-FINGER_JOINT, GRIP_OPEN, GRIP_CLOSED = "finger_joint", 0.0, 0.72  # rad; stay off the 47 deg (0.82 rad) limit
+# Close target past the thinnest thing gripped: a 6 mm lid tab is reached at ~0.74 rad, and a target short of contact
+# squeezes with no force. Stays off the 47 deg (0.82 rad) limit.
+FINGER_JOINT, GRIP_OPEN, GRIP_CLOSED = "finger_joint", 0.0, 0.80
 # 2F-85 geometry (measured from the asset meshes): in the gripper base_link frame the pads span z 0.091..0.148
 # and close along y (open inner gap 0.087). TCP = pad centre: gripper base axes, 0.125 along z.
 T_GB_TCP = pose(np.eye(3), [0, 0, 0.125])
@@ -200,8 +202,9 @@ def style_box(box, rng):
 
 
 def size_box_for(length, width, height):
-    """Retailer practice: the box fits the pair heel-to-toe with a little play (updates BOX in place)."""
-    BOX["inner"] = (round(length + 0.03, 3), round(2 * width + 0.025, 3))
+    """The box fits the pair heel-to-toe with play (updates BOX in place). 6 cm of length play: a shoe is set
+    down 2 cm toward its toe, leaving room behind the heel for the gripper finger that pinches the heel counter."""
+    BOX["inner"] = (round(length + 0.06, 3), round(2 * width + 0.025, 3))
     BOX["height"] = round(height + 0.012, 3)
 
 

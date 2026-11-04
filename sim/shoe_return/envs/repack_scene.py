@@ -66,8 +66,24 @@ def ur_2f85_cfg(side, ur_limits=True, contact_offsets=True, usd=None):
     cfg.actuators["gripper_finger"] = ImplicitActuatorCfg(
         joint_names_expr=[".*_inner_finger_joint"], joint_effort_limit=10.0, joint_velocity_limit=10.0, stiffness=10.0, damping=0.05
     )
+    drive_both_knuckles(cfg)
     if contact_offsets:
         cfg.spawn.collision_props = PhysxCollisionCfg(contact_offset=0.005, rest_offset=0.0)
+    return cfg
+
+
+def drive_both_knuckles(cfg):
+    """Drive right_outer_knuckle_joint with the same PD as finger_joint instead of leaving it to the mimic
+    constraint alone. The two knuckles turn in mirrored directions, so a squeeze carried by the mimic constraint
+    reacts on the gripper base with a net torque that twists the wrist; two equal drives react and cancel."""
+    d = cfg.actuators["gripper_drive"]
+    cfg.actuators["gripper_drive"] = ImplicitActuatorCfg(
+        joint_names_expr=["finger_joint", "right_outer_knuckle_joint"], joint_effort_limit=d.joint_effort_limit,
+        joint_velocity_limit=d.joint_velocity_limit, stiffness=d.stiffness, damping=d.damping,
+    )
+    p = cfg.actuators.get("gripper_passive")
+    if p is not None:
+        p.joint_names_expr = [e for e in p.joint_names_expr if e != "right_outer_knuckle_joint"]
     return cfg
 
 
@@ -116,7 +132,9 @@ def make_scene_cfg(assets, width, height, wrist_cams=True, num_envs=1):
         ),
         init_state=ArticulationCfg.InitialStateCfg(pos=(*S.BOX_NOMINAL["center"], S.TABLE_Z), joint_pos={"lid_hinge": 0.0}),
         # Cardboard hinge: enough damping that a released lid settles rather than slams (lid gravity torque <= 0.2 Nm).
-        actuators={"hinge": ImplicitActuatorCfg(joint_names_expr=["lid_hinge"], stiffness=0.0, damping=0.25)},
+        # A paperboard hinge is stiff: a lid nudged near vertical creeps rather than flops shut. Heavy damping models
+        # that (with 0.25 an open lid brushed by a carried shoe fell closed); gravity near vertical is ~0.02 Nm.
+        actuators={"hinge": ImplicitActuatorCfg(joint_names_expr=["lid_hinge"], stiffness=0.0, damping=2.0)},
     )
     for k in range(2):
         setattr(
