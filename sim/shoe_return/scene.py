@@ -206,11 +206,13 @@ def style_box(box, rng):
 
 
 def size_box_for(length, width, height):
-    """The box fits the pair heel-to-toe with play (updates BOX in place). 6 cm of length play: a shoe is set
-    down 2 cm toward its toe, leaving room behind the heel for the gripper finger that pinches the heel counter.
+    """The box fits the pair heel-to-toe with play (updates BOX in place). 8 cm of length play, 4 cm at each end of a
+    shoe: room behind the heel for the gripper finger that pinches the heel counter, and room at the toe end for the
+    hanging toe to touch down inside the box when the shoe is laid down by pivoting on it (generous for a real
+    shoebox, a deliberate trade-off for this set-down).
     6 cm of width play across the pair: a heel-held shoe can turn a few degrees as its toe touches down and
     pivots flat; with less play it landed partly on the other shoe."""
-    BOX["inner"] = (round(length + 0.06, 3), round(2 * width + 0.06, 3))
+    BOX["inner"] = (round(length + 0.08, 3), round(2 * width + 0.06, 3))
     BOX["height"] = round(height + 0.025, 3)  # 2.5 cm headroom: with 1.2 cm a shoe resting slightly propped up stopped the lid
 
 
