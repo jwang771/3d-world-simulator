@@ -68,7 +68,7 @@ CARRY_JOINT_SPEED = 0.35  # rad/s, joint-space speed with a shoe in hand (a heel
 LID_BUFFER = 0.05  # m, extra clearance around the lid for collision-checked transits
 RELEASE = 2.0  # grip command: open fully (85 mm). Used once a shoe rests flat in the box: at pinch width the pads
 # still dragged a thick heel wall up with the hand.
-TOE_SHIFT = 0.0  # m, a placed shoe sits this far toward its toe from the box's centre line (centred: 4 cm each end)
+TOE_SHIFT = 0.02  # m, a placed shoe sits this far toward its toe from the box's centre line
 # A heel-held shoe hangs toe-down, its toe up to a shoe length (~0.3 m) below the hand: lift and carry high enough
 # that it clears the box walls (a toe that caught the box corner knocked the shoe out of the fingers).
 LIFT = 0.35  # m, lift after the grasp
