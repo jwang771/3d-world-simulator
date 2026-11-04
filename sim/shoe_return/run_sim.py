@@ -508,9 +508,12 @@ def heel_grasp(cell, k, dz=0.0):
 
 
 class Placement:
-    """Sets the held shoe down at a box-frame pose. A heel-held shoe hangs toe-down, so place it by the heel: keep the
-    hand top-down, put the grasped heel over its spot in the box, close the loop on the measured heel position and
-    shoe yaw, then lower until the open fingers just clear the rim and let go; the toe swings in first."""
+    """Sets the held shoe down at a box-frame pose the way a person lays down a shoe held by the heel: it hangs toe-down,
+    so put the heel above where the *toe* will end up, lower until the toe touches the floor, then swing the heel back
+    and down on an arc about that toe contact until the shoe lies flat with its heel on its spot. Lowering the heel
+    straight onto its spot instead made the toe slide a shoe length along the floor; rubber on cardboard often did not,
+    and the shoe stayed leaning (its top up to 9 cm above the rim, blocking the lid). Positions and heading are
+    closed-loop on the measured shoe."""
 
     def __init__(self, cell, k, xy_yaw):
         self.cell, self.k, self.xy_yaw = cell, k, xy_yaw
@@ -520,20 +523,34 @@ class Placement:
         # Shifted toe-ward, leaving room behind the heel for the outer finger (see scene.size_box_for).
         return self.cell.box_pose() @ pose(rot_z(yaw), [x, y, S.BOX["wall"] + 0.004]) @ pose(np.eye(3), [TOE_SHIFT, 0, 0])
 
-    def heel_target(self):
+    def grasp_local(self):
         g = np.asarray(self.cell.meta["grasp_local"], float)
-        if self.k == 1 and self.cell.meta["name"] != "procedural":
-            g = g * [1, -1, 1]
-        return (self.target() @ np.append(g, 1.0))[:3]
+        return g * [1, -1, 1] if self.k == 1 and self.cell.meta["name"] != "procedural" else g
+
+    def heel_target(self):
+        return (self.target() @ np.append(self.grasp_local(), 1.0))[:3]
+
+    def pivot(self):
+        """(toe direction, horizontal and vertical grasp-to-toe distances) of the shoe lying flat."""
+        g = self.grasp_local()
+        return self.target()[:3, 0], self.cell.meta["length"] / 2 - g[0], g[2] - 0.005
+
+    def floor_z(self):
+        return self.cell.box_pose()[2, 3] + S.BOX["wall"]
+
+    def start_xy(self):
+        """Heel above the toe's final contact point."""
+        x, rh, _ = self.pivot()
+        return (self.heel_target() + x * rh)[:2]
 
     def rim_tcp_z(self):
         return self.cell.box_pose()[2, 3] + S.BOX["height"] + S.PAD_BELOW_TCP + 0.012
 
     def errors(self, cap=None):
-        """Heel position error and yaw error of the held shoe relative to its spot in the box. `cap` bounds the
-        horizontal correction (used for fine alignment, so a shoe lost from the hand cannot send the arm across the cell)."""
+        """Heel position error (to the pivot start) and yaw error of the held shoe. `cap` bounds the horizontal
+        correction (fine alignment: a shoe lost from the hand cannot send the arm across the cell)."""
         Sh = self.cell.shoe_pose(self.k)
-        e = self.heel_target() - grasp_point(self.cell, self.k)
+        e = np.append(self.start_xy() - grasp_point(self.cell, self.k)[:2], 0.0)
         n = np.linalg.norm(e[:2])
         if cap is not None and n > cap:
             e[:2] *= cap / n
@@ -564,14 +581,28 @@ class Placement:
         return Track(goal, done, speed=0.06, turn=0.5, timeout=1200)
 
     def rest_tcp_z(self):
-        """TCP height at which the held heel is ~1 cm above the box floor: the shoe then rests flat on its sole and
-        lets go of the fingers cleanly (released while hanging, it stayed hooked on the finger inside the collar)."""
-        return self.cell.box_pose()[2, 3] + S.BOX["wall"] + self.cell.meta["grasp_local"][2] + 0.010
+        """TCP height with the shoe lying flat (heel grasp point ~1 cm above its resting height)."""
+        return self.floor_z() + self.grasp_local()[2] + 0.010
 
-    def descend(self):
-        """Quickly to 8 cm above the resting height, then slowly down onto the floor."""
-        return [Move(lambda arm: (np.array([arm.p[0], arm.p[1], self.rest_tcp_z() + 0.08]), arm.R), speed=0.15),
-                Move(lambda arm: (np.array([arm.p[0], arm.p[1], self.rest_tcp_z()]), arm.R), speed=0.03)]
+    def descend(self, n=8):
+        """Down until the hanging toe touches the floor, then the heel swings back and down on an arc about the toe."""
+        x, rh, rz = self.pivot()
+        r, phi1 = np.hypot(rh, rz), np.arctan2(rz, rh)
+        state = {}
+
+        def arc_point(phi):
+            def goal(arm):
+                if "toe" not in state:  # toe contact fixed where the heel came down (closed loop up to here)
+                    state["toe"] = np.append(arm.p[:2], self.floor_z())
+                p = state["toe"] - x * r * np.cos(phi) + np.array([0, 0, r * np.sin(phi) + 0.010])
+                return p, arm.R
+            return goal
+
+        touch_z = lambda: self.floor_z() + r + 0.015
+        moves = [Move(lambda arm: (np.array([arm.p[0], arm.p[1], touch_z() + 0.08]), arm.R), speed=0.15),
+                 Move(lambda arm: (np.array([arm.p[0], arm.p[1], touch_z()]), arm.R), speed=0.04)]
+        moves += [Move(arc_point(phi), speed=0.04, min_steps=20, settle=30) for phi in np.linspace(np.pi / 2, phi1, n + 1)[1:]]
+        return moves
 
 
 class Lid:
