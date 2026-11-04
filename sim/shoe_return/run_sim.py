@@ -760,7 +760,11 @@ def script(cell, lid):
         released = lambda arm: grasp_point(cell, pl.k)[2] < pl.rest_tcp_z() + 0.025
         set_down = lambda: [pl.align(), *pl.descend(), hold(90, RELEASE), Move(centre_in_collar, speed=0.02),
                             Move(up(0.05), speed=0.05), Branch(released, unhook), Move(up(0.10), speed=0.15)]
-        return [MoveJ(pl(CARRY_DZ)), *([recheck(retries)] if retries else []), Branch(dropped_in, set_down)]
+        # After letting go, check the shoe lies flat in the box (heel within 2.5 cm of resting on the floor); a shoe
+        # left propped on the end wall or on the other shoe stops the lid. If not, pick it up and place it again, once.
+        flat = lambda arm: shoe_in_box(cell, pl.k) and grasp_point(cell, pl.k)[2] < pl.rest_tcp_z() + 0.015
+        redo = [Branch(flat, lambda: [home_j(), *pick(pl.k, retries=1), *place(pl, retries=0)])] if retries else []
+        return [MoveJ(pl(CARRY_DZ)), *([recheck(retries)] if retries else []), Branch(dropped_in, set_down), *redo]
 
     if args.skill == "pick":
         return [("pick", {"right": [*pick(0, retries=0), hold(480, 0.0)]})]
