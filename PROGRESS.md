@@ -171,3 +171,5 @@ The phase order in the master prompt was not followed strictly: Phase 4 code was
 3. Re-run the 20-seed gate.
 4. Collect 200+ successful episodes (~6 per hour per Isaac process on this machine).
 5. Retrain ACT and Diffusion Policy. Consider sub-task conditioning (open lid / place / close) and closed-loop proprio from measured joints rather than commands.
+
+**2026-11-04 09:50: build tools installed by the user; Mimic installed (ran and passed).** `uv sync --extra isaacsim --extra rsl-rl --extra video --extra mimic` built `egl-probe` 1.0.2 from source and installed `isaaclab-mimic` 2.0.12, `isaaclab-teleop` 0.10.3 and `robomimic` 0.4.0 (pinned by Isaac Lab's `uv.lock` at `e3f7d9f`). `isaaclab_mimic` imports under Kit, and the shoe sim still runs (pick probe: shoe held at 0.345 m). Not yet used: Mimic generates data only for tasks written as an Isaac Lab `ManagerBasedRLMimicEnv`, and `run_sim.py` is a standalone script.
