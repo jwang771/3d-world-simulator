@@ -1,6 +1,6 @@
 # Shoe returns simulation (Isaac Lab 3.0 / Isaac Sim 6.2)
 
-A returns-handling cell that generates training data for this repo's 3D world model (`--task shoe_return`), plus imitation-learning baselines trained on that data. Status, measured success rates and history are in [../../PROGRESS.md](../../PROGRESS.md). **The Phase 0 gate (18/20 scripted successes) is not met yet; see the progress log for the measured rate.**
+A returns-handling cell that generates training data for this repo's 3D world model (`--task shoe_return`), plus imitation-learning baselines trained on that data. Status, measured success rates and history are in [../../PROGRESS.md](../../PROGRESS.md). **The Phase 0 gate (18/20 scripted successes) is not met: the latest 20-seed run scored 13/20. Policy baselines score 0/10 on held-out shoes. Details in the progress log.**
 
 ## Cell
 

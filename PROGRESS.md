@@ -147,8 +147,27 @@ Further expert fixes, each from an observed failure: box turned so the hinge fac
 | Gate 2 | `041478b` | 5/7 when stopped (to test a fix) |
 | Gate 3 | `739056f` (toe-pivot set-down, 8 cm box play) | 1/3 when stopped: worse; reverted (`3709e82`) |
 | Gate 4 | `3709e82` (+ "level sole" re-place check) | 0/2 when stopped: the check re-picked shoes that were fine; reverted (`3f6d350`) |
-| Gate 5 | `3f6d350` (= `041478b` + an end-of-episode debug print) | see below |
+| Gate 5 | `3f6d350` (= `041478b` + an end-of-episode debug print) | **13/20 (65%), complete run.** Failures: lid could not close 4 (Mako x2, Amherst; second shoe propped), shoe outside box 2 (Nellie chukka x2), timeout 2 (repeated slips/regrasps). `check_dataset.py`: 20/20 load |
 
 Failure classes that remain (from `[end]` diagnostics and frames): (1) the second shoe ends propped or tilted (its top up to 9-11 cm above the rim), so the lid cannot close; this is the most common; (2) a heel-pinched shoe rolls about the closing axis or slips out in transit (the collar pinch resists twist poorly); (3) a few shoe models fail every time (Mako moccasin, Nellie chukka boot).
 
 **Phase 4, round 2 (ran; result: no success).** 23 successful episodes from 14 distinct training shoes (none of the 12 held-out shoes), copied into one dataset. ACT trained without proprio input (cameras only) plus image shift/colour augmentation; Diffusion Policy with proprio noise (0.1) plus the same augmentation; 20k steps each, seed 0. Closed-loop on held-out shoes (seeds 9000-9009, 16000-step limit): **ACT 0/10, Diffusion Policy 0/10.** ACT without proprio no longer freezes but jumps between poses and never pinches the lid tab; Diffusion Policy mostly hovers near its start pose. 23 demonstrations of a ~600-step, two-arm, multi-stage task is far too little data for either method; the M4 target (70% on held-out shoes) is not met.
+
+**End of session 2: status against the gates (honest).**
+
+| Milestone | Status |
+|---|---|
+| M0 | **Not met.** Install pinned, ran and passed. Scripted T1 at 13/20 on the 20-seed gate (needs 18/20). Dataset loads through the repo loaders (20/20). Video committed (`docs/media/t1_scripted_success.mp4`). |
+| M1 | Not met. 63 shoe models (target 30+), held-out split 51/12. One box type (target 3). T1 below 90%. No asset gallery. |
+| M2, M3 | Not started: tasks T2-T8, teleop and Mimic. Mimic needs `sudo apt install build-essential`, still not installed. ~30 successful scripted episodes collected so far, against a 10k target. |
+| M4 | **Not met.** ACT and Diffusion Policy implemented and evaluated in closed loop on held-out shoes: 0/10 each (round 2, 23 demonstrations). |
+| M5, M6 | Not started. |
+
+The phase order in the master prompt was not followed strictly: Phase 4 code was built and run before the Phase 0 gate passed, on the user's instruction to "keep going until phase 4".
+
+**Next, in order:**
+1. Second-shoe set-down. Detect a rolled or propped shoe from its measured pose before release, and re-grip rather than re-pick. Consider a grasp that resists roll, such as a deeper collar pinch or a two-point heel-counter grasp.
+2. Fix the two shoe models that always fail.
+3. Re-run the 20-seed gate.
+4. Collect 200+ successful episodes (~6 per hour per Isaac process on this machine).
+5. Retrain ACT and Diffusion Policy. Consider sub-task conditioning (open lid / place / close) and closed-loop proprio from measured joints rather than commands.

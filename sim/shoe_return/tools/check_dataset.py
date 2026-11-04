@@ -70,9 +70,9 @@ def check_episode(path, task, n_frames):
         if not torch.isfinite(s["xyz"]).all():
             problems.append(f"non-finite points at frame {t}")
         if int(s["obj_label"].sum()) == 0:
-            # Shoes must be visible at the start; at the end of a successful episode they are inside a closed box,
-            # where no camera sees them.
-            closed_at_end = gi == picks[-1] and bool(h5py.File(path, "r").attrs.get("success", False))
+            # Shoes must be visible at the start; at the end of an episode whose lid ended (mostly) closed they are
+            # inside the box, where no camera sees them.
+            closed_at_end = gi == picks[-1] and float(h5py.File(path, "r").attrs.get("hinge_deg", 90.0)) < 45.0
             if not closed_at_end:
                 problems.append(f"no shoe points at frame {t}")
         frames.render(fi, t)
