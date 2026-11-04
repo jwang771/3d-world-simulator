@@ -36,13 +36,15 @@ parser.add_argument("--keep-failures", action="store_true", help="also write epi
 parser.add_argument("--max-steps", type=int, default=16000)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--grasp", default="collar", choices=["collar", "clamp"], help="shoe grasp: collar pinch or whole-heel clamp")
-parser.add_argument("--shoe", default="random", help="scanned shoe model name from the library, 'random', or 'procedural'")
+parser.add_argument("--shoe", default="random", help="scanned shoe model name, 'random', 'random:train' / 'random:test' (held-out split), or 'procedural'")
 parser.add_argument("--debug", action="store_true", help="print TCP tracking error twice a second")
 parser.add_argument("--skill", default=None, choices=["pick", "carry"], help="debug: run one skill instead of the task (pick: lift shoe 0 and hold it; carry: also swing it over the box and back)")
 parser.add_argument("--grasp-depth", type=float, default=0.015, help="lower the shoe grasp point by this much (m) so the pads cover the heel counter, not just the collar edge")
 parser.add_argument("--grip-effort", type=float, default=None, help="override the 2F-85 finger_joint effort limit (Nm)")
 parser.add_argument("--grip-close", type=float, default=None, help="finger_joint close target (rad); default S.GRIP_CLOSED")
 parser.add_argument("--grip-stiffness", type=float, default=None, help="override the 2F-85 finger_joint drive stiffness")
+parser.add_argument("--policy", default=None, help="evaluate a trained policy checkpoint (policy/train.py) instead of the scripted expert")
+parser.add_argument("--no-write", action="store_true", help="do not write episode files (policy evaluation)")
 parser.add_argument("--video", default=None, help="write the overhead camera of every episode to <dir>/episode_<E>.mp4")
 add_launcher_args(parser)
 args = parser.parse_args()
@@ -56,9 +58,10 @@ from geometry import mat_to_quat, mat_to_rotvec, pose, quat_to_mat, rot_x, rot_z
 PHYSICS_HZ = 120
 HOME = {"left": np.array([-0.45, 0.02, 0.35]), "right": np.array([0.40, 0.02, 0.35])}
 RIGHT_WAIT = np.array([0.30, -0.18, 0.30])
-LID_OPEN_DEG = 100.0  # past vertical: the lid then rests open on its 105 deg stop by itself
+LID_OPEN_DEG = 100.0  # past vertical: the lid then rests open on its 105 deg stop by itself (the swing often stalls
+# at ~94 deg, already past vertical, so the opening swing is time-limited)
 LID_CLOSED_DEG = 2.0
-CARRY_JOINT_SPEED = 0.45  # rad/s, joint-space speed with a shoe in hand (at 0.9 a heel-held shoe was flung out)
+CARRY_JOINT_SPEED = 0.6  # rad/s, joint-space speed with a shoe in hand (at 0.9 a heel-held shoe was flung out)
 LID_BUFFER = 0.05  # m, extra clearance around the lid for collision-checked transits
 TOE_SHIFT = 0.02  # m, a placed shoe sits this far toward its toe from the box's centre line
 # A heel-held shoe hangs toe-down, its toe up to a shoe length (~0.3 m) below the hand: lift and carry high enough
@@ -107,7 +110,14 @@ def prepare_assets(cache, rng, shoe="random"):
     else:
         lib = HERE / S.SHOE_LIBRARY
         names = sorted(d.name for d in lib.iterdir() if (d / "meta.json").exists())
-        name = names[rng.integers(len(names))] if shoe == "random" else shoe
+        if shoe.startswith("random"):
+            # "random:train" / "random:test": every 5th model (alphabetical) is held out for policy evaluation.
+            split = shoe.partition(":")[2]
+            if split:
+                names = [n for i, n in enumerate(names) if (i % 5 == 4) == (split == "test")]
+            name = names[rng.integers(len(names))]
+        else:
+            name = shoe
         m = json.loads((lib / name / "meta.json").read_text())
         out["shoe_0"], out["shoe_1"] = str(lib / name / "left.usd"), str(lib / name / "right.usd")
         # Collar pinch by default: one finger inside the collar, one behind the heel, closing along the shoe's
@@ -549,7 +559,9 @@ class Placement:
         return self.cell.box_pose()[2, 3] + S.BOX["wall"] + self.cell.meta["grasp_local"][2] + 0.010
 
     def descend(self):
-        return Move(lambda arm: (np.array([arm.p[0], arm.p[1], self.rest_tcp_z()]), arm.R), speed=0.06)
+        """Quickly to 8 cm above the resting height, then slowly down onto the floor."""
+        return [Move(lambda arm: (np.array([arm.p[0], arm.p[1], self.rest_tcp_z() + 0.08]), arm.R), speed=0.15),
+                Move(lambda arm: (np.array([arm.p[0], arm.p[1], self.rest_tcp_z()]), arm.R), speed=0.05)]
 
 
 class Lid:
@@ -609,7 +621,7 @@ class Lid:
         T = self.lid_pose(deg) @ self.T_lid_tcp @ pose(np.eye(3), [0, 0, -standoff])
         return T[:3, 3], T[:3, :3]
 
-    def swing(self, to_deg, lead_deg=12.0, tol_deg=3.0):
+    def swing(self, to_deg, lead_deg=12.0, tol_deg=3.0, timeout=4800):
         """Swing the held lid toward to_deg by targeting the lid pose a few degrees past the *measured* hinge angle,
         so the arm follows the lid wherever the box actually is instead of dragging it along a fixed arc."""
 
@@ -620,8 +632,9 @@ class Lid:
             T = self.T_hinge0 @ pose(rot_x(-np.deg2rad(now + step)), [0, 0, 0]) @ self.T_lid_tcp
             return T[:3, 3], T[:3, :3]
 
-        # Compliance 0.35: soft enough not to drag the box, stiff enough to swing the damped paperboard hinge.
-        return [Track(goal, lambda arm: abs(self.cell.hinge_deg() - to_deg) < tol_deg, speed=0.12, turn=0.6, timeout=4800, compliance=0.35)]
+        # Compliance 0.35: the hand yields to the hinge constraint. (Stiffer, 0.6 with an 18 deg lead, let the lid
+        # stall near vertical and slide back shut inside the pinch.)
+        return [Track(goal, lambda arm: abs(self.cell.hinge_deg() - to_deg) < tol_deg, speed=0.12, turn=0.6, timeout=timeout, compliance=0.35)]
 
     def grasp(self):
         state = {}
@@ -689,7 +702,9 @@ def script(cell, lid):
 
         in_hand = lambda arm: np.linalg.norm(grasp_point(cell, pl.k) - arm.tcp()[:3, 3]) < HELD_DIST
         dropped_in = lambda arm: shoe_in_box(cell, pl.k) and not in_hand(arm)
-        set_down = lambda: [pl.align(), pl.descend(), hold(60, 1.0), Move(up(0.15), speed=0.08)]
+        # Let go fully before rising, and rise slowly at first so the finger inside the collar slides out instead
+        # of hooking the shoe (a fast lift carried a released shoe back out of the box).
+        set_down = lambda: [pl.align(), *pl.descend(), hold(90, 1.0), Move(up(0.05), speed=0.05), Move(up(0.10), speed=0.15)]
         return [MoveJ(pl(CARRY_DZ)), *([recheck(retries)] if retries else []), Branch(dropped_in, set_down)]
 
     if args.skill == "pick":
@@ -699,7 +714,7 @@ def script(cell, lid):
     return [
         # Left arm pinches the pull tab and swings the lid past vertical; it stays open on its stop, so the arm
         # lets go and clears the box. Right arm waits, empty, above shoe 1 (holding a shoe for long lets it creep out).
-        ("open_lid", {"left": [*lid.grasp(), *lid.swing(LID_OPEN_DEG), hold(40, 1.0), Move(back_off(0.08)), home_j()],
+        ("open_lid", {"left": [*lid.grasp(), *lid.swing(LID_OPEN_DEG, timeout=900), hold(40, 1.0), Move(back_off(0.08)), home_j()],
                       "right": [MoveJ(heel_grasp(cell, 0, 0.12), grip=1.0)]}),
         # Long transits go through the home pose (joint space).
         ("place_shoes", {"right": [*pick(0), *place(place1), home_j(), *pick(1), *place(place2), home_j()]}),
@@ -712,6 +727,55 @@ def shoe_in_box(cell, k):
     T = np.linalg.inv(cell.box_pose()) @ cell.shoe_pose(k)
     (lx, ly), h = S.BOX["inner"], S.BOX["height"]
     return abs(T[0, 3]) < lx / 2 and abs(T[1, 3]) < ly / 2 and T[2, 3] < h and T[2, 2] > 0.7
+
+
+# ---------------------------------------------------------------- learned policy
+
+
+class PolicyRunner:
+    """Closed-loop execution of a policy/train.py checkpoint: every STRIDE recorded frames, predict an action chunk
+    from the cameras and the previous command, and execute its first `n_exec` steps as TCP targets (receding horizon)."""
+
+    def __init__(self, path, n_exec=8):
+        import torch
+
+        sys.path.insert(0, str(HERE / "policy"))
+        import data as pdata
+        from models import build
+
+        self.torch, self.pdata, self.n_exec = torch, pdata, n_exec
+        ck = torch.load(path, map_location="cuda", weights_only=False)
+        cfg = ck["cfg"]
+        self.model = build(cfg["kind"], **cfg.get("model", {}), chunk=cfg["chunk"], pretrained=False).cuda().eval()
+        self.model.load_state_dict(ck["state"])
+        self.lo, self.hi = np.array(ck["stats"]["lo"], np.float32), np.array(ck["stats"]["hi"], np.float32)
+        self.period = args.record_every * pdata.STRIDE  # physics steps per policy step
+        self.reset()
+
+    def reset(self):
+        self.chunk, self.i = None, 0
+
+    def step(self, frames, arms):
+        pd, torch = self.pdata, self.torch
+        if self.chunk is None or self.i >= self.n_exec:
+            import cv2
+
+            imgs = np.stack([cv2.resize(frames[c]["rgb"], (pd.IMG_HW[1], pd.IMG_HW[0]), interpolation=cv2.INTER_AREA) for c in pd.CAMS])
+            prev = pd.to_policy_action(np.concatenate([arms["left"].action(), arms["right"].action()])[None])[0]
+            prev = 2 * (prev - self.lo) / np.maximum(self.hi - self.lo, 1e-4) - 1
+            x = torch.from_numpy(imgs).permute(0, 3, 1, 2).float().div(255).unsqueeze(0).cuda()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = self.model.act(x, torch.from_numpy(prev).float().unsqueeze(0).cuda())
+            self.chunk = (out[0].float().cpu().numpy() + 1) / 2 * (self.hi - self.lo) + self.lo
+            self.i = 0
+        a = self.chunk[self.i]
+        self.i += 1
+        for side, (p, R, g) in zip(("left", "right"), self.pdata.from_policy_action(a)):
+            arms[side].p, arms[side].R, arms[side].grip = np.asarray(p, float), np.asarray(R, float), 1.0 if g > 0.5 else 0.0
+
+
+def task_done(cell):
+    return all(shoe_in_box(cell, i) for i in range(2)) and cell.hinge_deg() < 5.0
 
 
 # ---------------------------------------------------------------- recording
@@ -833,6 +897,7 @@ def main():
         task = TASKS["shoe_return"]
         out = Path(args.out)
         stats = []
+        policy = PolicyRunner(args.policy) if args.policy else None
 
         def step(render):
             for arm in arms.values():
@@ -871,8 +936,12 @@ def main():
             writer = EpisodeWriter(out, split, ep, cam_ids, task)
             video = []
             phases, k, dropped, min_gap, phase_name = script(cell, lid), 0, False, np.inf, "setup"
+            policy_done = False
+            if policy is not None:
+                phases, phase_name = [], "policy"
+                policy.reset()
             while k < args.max_steps:
-                if all(a.idle for a in arms.values()):
+                if policy is None and all(a.idle for a in arms.values()):
                     if not phases:
                         break
                     phase_name, moves = phases.pop(0)
@@ -894,15 +963,21 @@ def main():
                           f"heel z {grasp_point(cell, 0)[2]:.3f}/{grasp_point(cell, 1)[2]:.3f}", flush=True)
                 if record:
                     frames = recorder.frames()
-                    robot_boxes, grip_boxes = recorder.label_boxes()
-                    writer.add_frame(np.concatenate([arms["left"].action(), arms["right"].action()]), frames, robot_boxes, grip_boxes)
+                    if not args.no_write:
+                        robot_boxes, grip_boxes = recorder.label_boxes()
+                        writer.add_frame(np.concatenate([arms["left"].action(), arms["right"].action()]), frames, robot_boxes, grip_boxes)
                     if args.video:
                         video.append(frames[0]["rgb"])
+                    if policy is not None and k % policy.period == 0:
+                        if k > 0 and task_done(cell):
+                            policy_done = True
+                            break
+                        policy.step(frames, arms)
                 if any(cell.shoe_pose(i)[2, 3] < S.TABLE_Z - 0.05 for i in range(2)):
                     dropped = True
                     break
                 k += 1
-            finished = not phases and all(a.idle for a in arms.values())
+            finished = policy_done if policy is not None else (not phases and all(a.idle for a in arms.values()))
             for _ in range(60):
                 step(render=False)
             inside = [shoe_in_box(cell, i) for i in range(2)]
@@ -911,9 +986,12 @@ def main():
             reason = None if ok else ("shoe_dropped" if dropped else "timeout" if not finished else "arm_collision" if min_gap <= ARM_CLEARANCE else "shoe_outside_box" if not all(inside) else "lid_open")
             wall = time.time() - t0
             print(f"[ep {ep}] phase={phase_name} in_box={inside} hinge={hinge:.1f}deg gap={min_gap:.2f}m -> {'ok' if ok else 'FAILED: ' + reason} ({writer.T} frames, {wall:.0f}s)", flush=True)
-            stats.append(dict(episode=ep, success=ok, failure=reason, phase=phase_name, hinge_deg=hinge, frames=writer.T, wall_s=wall))
-            if ok or args.keep_failures:
-                writer.close(dict(success=ok, failure_label=reason or "", failure_phase="" if ok else phase_name, hinge_deg=hinge, seed=args.seed, schema_version=1))
+            stats.append(dict(episode=ep, success=ok, failure=reason, phase=phase_name, hinge_deg=hinge, frames=writer.T, wall_s=wall, shoe=assets["shoe_meta"]["name"], seed=args.seed, expert=args.policy or "scripted"))
+            if args.no_write:
+                writer.discard()
+            elif ok or args.keep_failures:
+                writer.close(dict(success=ok, failure_label=reason or "", failure_phase="" if ok else phase_name, hinge_deg=hinge, seed=args.seed, schema_version=1,
+                                  shoe=assets["shoe_meta"]["name"], expert=args.policy or "scripted"))
             else:
                 writer.discard()
             if args.video and video:

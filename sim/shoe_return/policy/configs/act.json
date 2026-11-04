@@ -1,0 +1,2 @@
+{"kind": "act", "chunk": 16, "batch": 32, "lr": 1e-4, "lr_backbone": 1e-5, "wd": 1e-4, "steps": 20000, "ema": false,
+ "model": {"d": 256, "enc_layers": 4, "dec_layers": 6, "latent": 32}}

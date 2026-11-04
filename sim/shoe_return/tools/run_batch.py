@@ -27,7 +27,11 @@ def run_one(e, args, extra):
            "--seed", str(args.seed + e), "--val-every", str(args.val_every), *extra]
     if args.keep_failures:
         cmd.append("--keep-failures")
-    env = dict(os.environ, OMNI_KIT_ACCEPT_EULA="YES")
+    # Each Isaac process otherwise spreads over every core; several at once then thrash (load 98 on 32 threads).
+    threads = str(args.threads)
+    env = dict(os.environ, OMNI_KIT_ACCEPT_EULA="YES", OMP_NUM_THREADS="4", MKL_NUM_THREADS="4")
+    if args.threads:
+        cmd += ["--kit_args", f"--/plugins/carb.tasking.plugin/threadCount={threads}"]
     t0 = time.time()
     with open(work / "log.txt", "w") as log:
         rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, timeout=args.timeout).returncode
@@ -55,12 +59,13 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--episodes", type=int, default=20)
     ap.add_argument("--start-episode", type=int, default=0)
-    ap.add_argument("--workers", type=int, default=5)
+    ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--seed", type=int, default=1000)
     ap.add_argument("--val-every", type=int, default=10)
     ap.add_argument("--keep-failures", action="store_true")
     ap.add_argument("--keep-work", action="store_true", help="keep per-episode work dirs (logs, asset caches)")
     ap.add_argument("--timeout", type=int, default=3600)
+    ap.add_argument("--threads", type=int, default=0, help="cap Kit task threads per Isaac process (0: no cap). Measured on a\n                    32-thread machine: one uncapped process ~53 physics steps/s; 2 capped at 8 ~11 steps/s each; 5 uncapped thrash")
     args, extra = ap.parse_known_args()
     extra = [a for a in extra if a != "--"]
     out = Path(args.out)
