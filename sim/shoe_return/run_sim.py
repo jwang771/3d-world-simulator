@@ -557,10 +557,11 @@ class Placement:
             return arm.p + [e[0], e[1], 0.0], rot_z(dyaw) @ arm.R
 
         def done(arm):
+            # 0.04 rad: a 0.3 m shoe 6 deg off swings its toe ~3 cm sideways, more than its share of the box play.
             e, dyaw = self.errors()
-            return np.linalg.norm(e[:2]) < 0.012 and abs(dyaw) < 0.10
+            return np.linalg.norm(e[:2]) < 0.008 and abs(dyaw) < 0.04
 
-        return Track(goal, done, speed=0.06, turn=0.5, timeout=720)
+        return Track(goal, done, speed=0.06, turn=0.5, timeout=1200)
 
     def rest_tcp_z(self):
         """TCP height at which the held heel is ~1 cm above the box floor: the shoe then rests flat on its sole and
