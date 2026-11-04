@@ -36,8 +36,12 @@ PAD_BELOW_TCP = 0.023  # how far the fingertips reach past the TCP along the app
 
 # yaw = pi: hinge on the far side, front (pull tab) toward the robots, as a box faces a packer. The box sits in a
 # nest on the table (fixed base): a free box gets dragged or lifted by any arm-lid mismatch.
-BOX_NOMINAL = dict(center=(-0.16, -0.26), yaw=np.pi)
-BOX = dict(inner=(0.31, 0.24), height=0.11, wall=0.006, lid_t=0.006, skirt=0.035, gap=0.003, open_limit=105.0)
+# Hinge toward the left arm (box +y -> world -x): the left arm lifts the tab on the box's right edge and swings the
+# lid up and over toward itself, close in, and the open lid then leans away from the right arm's shoe traffic. (With the
+# hinge on the far side, opening pushed the lid away from the robots at the reach limit and often stalled short of
+# vertical.)
+BOX_NOMINAL = dict(center=(-0.16, -0.20), yaw=np.pi / 2)
+BOX = dict(inner=(0.31, 0.24), height=0.11, wall=0.006, lid_t=0.006, skirt=0.035, gap=0.003, open_limit=98.0)
 # Pull tab on the lid front (a ribbon loop on many shoeboxes), pinched across its thickness, top-down.
 TAB = dict(depth=0.035, height=0.03, thick=0.006)
 SHOE_REGION = dict(x=(0.16, 0.62), y=(-0.50, 0.05))

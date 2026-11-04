@@ -58,8 +58,10 @@ from geometry import mat_to_quat, mat_to_rotvec, pose, quat_to_mat, rot_x, rot_z
 PHYSICS_HZ = 120
 HOME = {"left": np.array([-0.45, 0.02, 0.35]), "right": np.array([0.40, 0.02, 0.35])}
 RIGHT_WAIT = np.array([0.30, -0.18, 0.30])
-LID_OPEN_DEG = 100.0  # past vertical: the lid then rests open on its 105 deg stop by itself (the swing often stalls
-# at ~94 deg, already past vertical, so the opening swing is time-limited)
+LID_HOLD_DEG = 92.0  # held open by the left arm during packing
+LID_OPEN_DEG = 95.0  # past vertical: the lid then rests open on its 98 deg stop by itself. (A 105 deg stop put the
+# tab out of comfortable reach for closing. The swing can stall short of vertical for some box poses: it is
+# time-limited and followed by a push on the lid's inner face if needed.)
 LID_CLOSED_DEG = 2.0
 CARRY_JOINT_SPEED = 0.6  # rad/s, joint-space speed with a shoe in hand (at 0.9 a heel-held shoe was flung out)
 LID_BUFFER = 0.05  # m, extra clearance around the lid for collision-checked transits
@@ -154,9 +156,10 @@ class Track:
     """Closed-loop move: the goal is re-evaluated every step (e.g. from a measured hinge angle) and approached at
     bounded speed; it ends when `done(arm)` holds or after `timeout` steps."""
 
-    def __init__(self, goal, done, grip=None, speed=0.15, turn=0.8, timeout=2400, compliance=None):
+    def __init__(self, goal, done, grip=None, speed=0.15, turn=0.8, timeout=2400, compliance=None, keep_compliance=False):
         self.goal, self.done, self.grip, self.speed, self.turn, self.timeout = goal, done, grip, speed, turn, timeout
         self.compliance = compliance  # arm joint stiffness scale while tracking, like a UR in force mode
+        self.keep_compliance = keep_compliance  # stay compliant afterwards (e.g. while holding a lid open)
 
 
 class MoveJ(Move):
@@ -384,7 +387,7 @@ class Arm:
             ang = np.linalg.norm(mat_to_rotvec(self.R.T @ R1))
             self.R = R1 if ang <= m.turn / PHYSICS_HZ else slerp_mat(self.R, R1, m.turn / PHYSICS_HZ / ang)
             if m.done(self) or m.k >= m.timeout:
-                if m.compliance is not None:
+                if m.compliance is not None and not m.keep_compliance:
                     self.set_compliance(1.0)
                 self.p, self.R = self.tcp()[:3, 3].copy(), self.tcp()[:3, :3].copy()  # continue from where the hand is
                 self.move = None
@@ -621,7 +624,7 @@ class Lid:
         T = self.lid_pose(deg) @ self.T_lid_tcp @ pose(np.eye(3), [0, 0, -standoff])
         return T[:3, 3], T[:3, :3]
 
-    def swing(self, to_deg, lead_deg=12.0, tol_deg=3.0, timeout=4800):
+    def swing(self, to_deg, lead_deg=12.0, tol_deg=3.0, timeout=4800, keep_compliance=False):
         """Swing the held lid toward to_deg by targeting the lid pose a few degrees past the *measured* hinge angle,
         so the arm follows the lid wherever the box actually is instead of dragging it along a fixed arc."""
 
@@ -634,7 +637,8 @@ class Lid:
 
         # Compliance 0.35: the hand yields to the hinge constraint. (Stiffer, 0.6 with an 18 deg lead, let the lid
         # stall near vertical and slide back shut inside the pinch.)
-        return [Track(goal, lambda arm: abs(self.cell.hinge_deg() - to_deg) < tol_deg, speed=0.12, turn=0.6, timeout=timeout, compliance=0.35)]
+        return [Track(goal, lambda arm: abs(self.cell.hinge_deg() - to_deg) < tol_deg, speed=0.12, turn=0.6, timeout=timeout, compliance=0.35,
+                      keep_compliance=keep_compliance)]
 
     def grasp(self):
         state = {}
@@ -646,6 +650,31 @@ class Lid:
             return goal
 
         return [MoveJ(at(0.10), grip=1.0), Move(at(0.0), speed=0.08), hold(60, 0.0), Branch(self.capture_grasp, list)]
+
+    def push_open(self, lead_deg=8.0, end_deg=95.0):
+        """Finish opening a lid that stalled short of vertical (the pinch-swing runs out of reach for some box
+        poses): with the fingers closed, press on the lid's inner face near its free edge from the robot side and
+        follow it open, compliant, until it is past vertical and rests on its stop."""
+        contact = np.array([0.0, -0.7 * self.Ly, 0.0])  # on the inner face, clear of the front skirt
+        state = {}
+
+        def tool(deg, arm, standoff):
+            T_h = state.setdefault("hinge", self.cell.box_pose() @ pose(np.eye(3), self.hinge))
+            T_l = T_h @ pose(rot_x(-np.deg2rad(deg)), [0, 0, 0])
+            n_in = -T_l[:3, 2]  # inner-face normal
+            z, y = -n_in, T_l[:3, 0]
+            R = np.stack([np.cross(y, z), y, z], axis=1)
+            if abs(wrap(tcp_yaw(R) - tcp_yaw(arm.R))) > np.pi / 2:
+                R = R @ rot_z(np.pi)  # the closed gripper is symmetric under a half turn
+            p = (T_l @ np.append(contact, 1.0))[:3] + n_in * (S.PAD_BELOW_TCP + standoff)
+            return p, R
+
+        # The lid keeps falling (below vertical gravity closes it) while the hand comes round, so after a quick
+        # approach the push tracks the *measured* angle: target = lid surface a few degrees further open.
+        approach = MoveJ(lambda arm: tool(self.cell.hinge_deg(), arm, 0.06), grip=0.0, joint_speed=1.5)
+        push = Track(lambda arm: tool(min(self.cell.hinge_deg() + lead_deg, S.BOX["open_limit"]), arm, -0.006),
+                     lambda arm: self.cell.hinge_deg() > end_deg, speed=0.15, turn=1.0, timeout=1200, compliance=0.5)
+        return [approach, push, Move(lambda arm: tool(self.cell.hinge_deg(), arm, 0.10), speed=0.15)]
 
     def push_closed(self, lead_deg=8.0, end_deg=3.0):
         """Close an open lid the way a person does: with the fingers closed, press on its outer face near the free
@@ -664,14 +693,13 @@ class Lid:
             R = np.stack([np.cross(y, z), y, z], axis=1)
             if abs(wrap(tcp_yaw(R) - tcp_yaw(arm.R))) > np.pi / 2 and abs(z[2]) > 0.7:
                 R = R @ rot_z(np.pi)  # the closed gripper is symmetric under a half turn
-            p = (T_l @ np.append(contact, 1.0))[:3] + n * standoff
+            p = (T_l @ np.append(contact, 1.0))[:3] + n * (S.PAD_BELOW_TCP + standoff)
             return p, R
 
-        approach = MoveJ(lambda arm: tool(state.setdefault("start", self.cell.hinge_deg()), arm, 0.07), grip=0.0)
-        touch = Move(lambda arm: tool(state["start"], arm, 0.0), speed=0.05)
-        follow = Track(lambda arm: tool(max(self.cell.hinge_deg() - lead_deg, 0.0), arm, -0.004),
-                       lambda arm: self.cell.hinge_deg() < end_deg, speed=0.10, turn=0.8, compliance=0.15)
-        return [approach, touch, follow, Move(lambda arm: tool(0.0, arm, 0.08), speed=0.1)]
+        approach = MoveJ(lambda arm: tool(self.cell.hinge_deg(), arm, 0.06), grip=0.0, joint_speed=1.5)
+        press = Track(lambda arm: tool(max(self.cell.hinge_deg() - lead_deg, -2.0), arm, -0.006),
+                      lambda arm: self.cell.hinge_deg() < end_deg, speed=0.10, turn=0.8, timeout=900, compliance=0.5)
+        return [approach, press, Move(lambda arm: tool(self.cell.hinge_deg(), arm, 0.08), speed=0.1)]
 
 
 def script(cell, lid):
@@ -704,7 +732,18 @@ def script(cell, lid):
         dropped_in = lambda arm: shoe_in_box(cell, pl.k) and not in_hand(arm)
         # Let go fully before rising, and rise slowly at first so the finger inside the collar slides out instead
         # of hooking the shoe (a fast lift carried a released shoe back out of the box).
-        set_down = lambda: [pl.align(), *pl.descend(), hold(90, 1.0), Move(up(0.05), speed=0.05), Move(up(0.10), speed=0.15)]
+        def unhook():
+            # The heel came up with the hand: the finger inside the collar caught it. Set it back down, shift the
+            # hand toward the toe so that finger moves off the heel wall into the opening, and lift again.
+            def toe_shift(arm):
+                x = cell.shoe_pose(pl.k)[:3, 0]
+                return arm.p - [0, 0, 0.05] + np.array([x[0], x[1], 0.0]) / max(np.linalg.norm(x[:2]), 1e-6) * 0.015, arm.R
+            return [Move(lambda arm: (arm.p - [0, 0, 0.05], arm.R), speed=0.05), hold(30, 1.0), Move(toe_shift, speed=0.03),
+                    Move(up(0.05), speed=0.04)]
+
+        released = lambda arm: grasp_point(cell, pl.k)[2] < pl.rest_tcp_z() + 0.025
+        set_down = lambda: [pl.align(), *pl.descend(), hold(90, 1.0), Move(up(0.05), speed=0.05),
+                            Branch(released, unhook), Move(up(0.10), speed=0.15)]
         return [MoveJ(pl(CARRY_DZ)), *([recheck(retries)] if retries else []), Branch(dropped_in, set_down)]
 
     if args.skill == "pick":
@@ -712,14 +751,16 @@ def script(cell, lid):
     if args.skill == "carry":
         return [("carry", {"right": [*pick(0, retries=0), MoveJ(place1(CARRY_DZ)), MoveJ(heel_grasp(cell, 1, 0.25)), hold(240, 0.0)]})]
     return [
-        # Left arm pinches the pull tab and swings the lid past vertical; it stays open on its stop, so the arm
-        # lets go and clears the box. Right arm waits, empty, above shoe 1 (holding a shoe for long lets it creep out).
-        ("open_lid", {"left": [*lid.grasp(), *lid.swing(LID_OPEN_DEG, timeout=900), hold(40, 1.0), Move(back_off(0.08)), home_j()],
+        # Left arm pinches the pull tab, swings the lid up to about vertical and *holds* it there while the right arm
+        # packs (the spec's "hold" option). Released lids crept shut below vertical or were knocked over, and
+        # regrasping the tab of a fully open lid was at the edge of the arm's reach. Right arm waits, empty, above shoe 1.
+        ("open_lid", {"left": [*lid.grasp(), *lid.swing(LID_HOLD_DEG, timeout=900, keep_compliance=True)],
                       "right": [MoveJ(heel_grasp(cell, 0, 0.12), grip=1.0)]}),
-        # Long transits go through the home pose (joint space).
         ("place_shoes", {"right": [*pick(0), *place(place1), home_j(), *pick(1), *place(place2), home_j()]}),
-        # Re-grasp the tab where the lid rests and swing it shut, then let go and clear.
-        ("close_lid", {"left": [*lid.grasp(), *lid.swing(LID_CLOSED_DEG), hold(50, 1.0), Move(back_off(0.08)), home_j()]}),
+        # Still holding the tab: swing the lid shut, let go and clear.
+        # If the compliant swing cannot seat the lid, let go and press it shut from above, as a person would.
+        ("close_lid", {"left": [*lid.swing(LID_CLOSED_DEG, timeout=2400), hold(50, 1.0), Move(back_off(0.08)),
+                                Branch(lambda arm: cell.hinge_deg() < 4.0, lid.push_closed), home_j()]}),
     ]
 
 
@@ -1075,7 +1116,7 @@ def fix_robot_prims():
 
     stage = get_current_stage()
     print(f"[fix] stripped {strip_nested_gripper_roots(stage)} nested gripper articulation roots", flush=True)
-    pads = S.friction_material(stage, "/World/Materials/finger_pads", 1.2)
+    pads = S.friction_material(stage, "/World/Materials/finger_pads", 1.5)  # silicone fingertip pads
     for prim in Usd.PrimRange(stage.GetPseudoRoot()):
         path = str(prim.GetPath())
         if S.GRIPPER_KEY in path and prim.HasAPI(UsdPhysics.RigidBodyAPI):

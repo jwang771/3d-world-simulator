@@ -108,3 +108,20 @@ The lockfile is Isaac Lab's own `uv.lock` at that commit; it gets copied into `s
 - **Fix:** drive `right_outer_knuckle_joint` with the same PD as `finger_joint` (`envs/repack_scene.drive_both_knuckles`). The empty gripper now closes to its target with zero arm error. A scanned shoe (SUPERSTAR) is lifted 0.20 m by the collar pinch and held for 5 s (120 stiffness, 30 Nm). Before the fix the same shoe slipped in every setting tried (40/10, 120/30, 400/30).
 
 **Lid knocked shut (ran, from recorded frames).** In the last session-1 episode the lid rested open on its stop, then an arm's joint-space transit swept through it. **Fix:** `collision.py`, a sphere model of both arms checked along every MoveJ against the table, the box, the lid (at the measured hinge angle) and the other arm. If the direct path is blocked, it detours via raised poses or random via-points. Offline test: `test_collision.py`, ran and passed. Isaac run: pending.
+
+**Later in session 2 (all ran; results are from single debug episodes and 5-episode mini-gates, not yet the 20-episode gate):**
+
+| Observed failure (frames + debug trace) | Change |
+|---|---|
+| 0.72 rad close target reached exactly with the knuckle fix, so a 6 mm lid tab (contact ~0.74 rad) was touched but not squeezed; the lid slid out at 53 deg | `GRIP_CLOSED` 0.80 rad (limit 0.82) |
+| Shoe picked first and held ~7 s while the lid opened crept out of the pinch | right arm waits empty above shoe 1; picks once the lid is up |
+| Placement steered by a heel error of 45 cm when the shoe was not in the hand: arm swept into the left arm | "still held?" check before placing; re-pick, or treat a shoe already in the box as placed; fine alignment capped at 8 cm |
+| Released while hanging toe-down at rim height, the shoe stayed hooked on the finger inside the collar and came back out | shoes are lowered until they rest flat (heel 1 cm above the floor), released at pinch width, lifted slowly; if the heel still comes up, set back down, shift 1.5 cm toe-ward, lift again. Box length play 6 cm, shoe set 2 cm toe-ward |
+| Hanging toe (up to ~0.3 m below the hand) struck the box corner in transit; the collision check missed it because a path in contact everywhere was trimmed to "free" | contact allowance limited to the first/last quarter of a path; held shoe modelled as spheres along its measured pose; lift and carry 0.35 m above the rim; carries at 0.6 rad/s; low inward detours preferred to high ones |
+| Released lid near vertical knocked or crept shut | paperboard hinge damping 0.25 -> 2.0 N m s/rad; planner buffer 5 cm around the lid |
+| Far-side hinge: opening pushed the lid away from the robots at the reach limit and stalled at 82-87 deg for some box poses; closing needed a tab regrasp at ~0.6 m reach; wrist wound to 269 deg | box turned so the hinge faces the left arm (`BOX_NOMINAL` yaw pi/2, 6 cm nearer); left arm now holds the lid open, compliant, during packing and swings it shut without letting go; press-to-close fallback; IK pulls toward home to unwind |
+| 5 Isaac processes in parallel: load 98 on 32 threads, workers stalled; 2 thread-capped workers ~11 steps/s each | sequential runs (one process ~53 physics steps/s); `tools/run_batch.py` |
+
+**Status at this point (honest):** 3 single-seed debug episodes succeeded end to end (SUPERSTAR, scripted expert). The first 5-episode mini-gate runs over random shoes and box poses had 0/5 successes with intermediate versions; each failure above was diagnosed from frames and fixed. The 20-episode Phase 0 gate has **not** been run on a stable version yet.
+
+**Policy baselines (Phase 4 code, not yet trained on real data):** `policy/` has ACT and Diffusion Policy in plain PyTorch (ResNet-18 ImageNet backbone via torchvision; no new major library), 6-D rotation actions, receding-horizon closed-loop evaluation in `run_sim.py --policy`, held-out shoe split (`--shoe random:train|test`, 51/12). Smoke-trained 400 steps on 2 episodes and rolled out in Isaac: the pipeline runs; no performance claims.

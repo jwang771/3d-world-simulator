@@ -114,12 +114,16 @@ def ik_best(Tg, current, home, model="ur10e", tol=1e-3, min_link_z=0.06):
             fallback = (q, res)
         if res > tol:
             continue
-        cands = [nearest_equivalent(q, current)]
-        cands.append(np.where(np.arange(6) == 2, (q + np.pi) % (2 * np.pi) - np.pi, cands[0]))  # elbow principal value
+        near = nearest_equivalent(q, current)
+        principal = (q + np.pi) % (2 * np.pi) - np.pi
+        cands = [near, np.where(np.arange(6) == 2, principal, near), principal]  # elbow principal; all principal
         for c in cands:
             if not within_limits(c) or min(T[2, 3] for T in frames(c, model)[1:5]) < min_link_z:
                 continue
-            cost = np.abs(c - current) @ [1.0, 1.0, 1.0, 0.6, 0.6, 0.3] + (0.0 if in_family(c) else 100.0)
+            # Least motion, staying in the usual family; the small pull toward home unwinds joints that a chain of
+            # nearest-equivalent solutions left a full turn away (a wrist at 269 deg cost a 434 deg move later).
+            cost = (np.abs(c - current) @ [1.0, 1.0, 1.0, 0.6, 0.6, 0.3] + (0.0 if in_family(c) else 100.0)
+                    + 0.15 * np.abs(c - np.asarray(home)).sum())
             if best is None or cost < best[1]:
                 best = (c, cost, res)
     if best is None:
