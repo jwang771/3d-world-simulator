@@ -2,7 +2,144 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import spconv.pytorch as spconv
+
+
+class _FlexTensor:
+    """Small adapter carrying FlexGEMM's COO features and coordinates."""
+    def __init__(self, features, indices, spatial_shape, batch_size, neighbor_caches=None):
+        self.features = features
+        self.indices = indices
+        self.spatial_shape = tuple(spatial_shape)  # z, y, x (spconv convention)
+        self.batch_size = int(batch_size)
+        # All feature-only operations preserve the active-site topology. Share
+        # FlexGEMM's neighbor maps across those layers, like spconv indice_key.
+        self.neighbor_caches = neighbor_caches if neighbor_caches is not None else {}
+
+    def replace_feature(self, features):
+        return _FlexTensor(features, self.indices, self.spatial_shape, self.batch_size, self.neighbor_caches)
+
+    def dense(self):
+        d, h, w = self.spatial_shape
+        out = self.features.new_zeros((self.batch_size, self.features.shape[1], d, h, w))
+        if self.indices.numel():
+            # FlexGEMM native coordinate order: [batch, x, y, z].
+            b, x, y, z = self.indices.long().unbind(1)
+            flat = ((b * d + z) * h + y) * w + x
+            out = out.permute(0, 2, 3, 4, 1).reshape(-1, self.features.shape[1])
+            out[flat] = self.features
+            out = out.view(self.batch_size, d, h, w, -1).permute(0, 4, 1, 2, 3).contiguous()
+        return out
+
+
+class _FlexConv3d(nn.Module):
+    """spconv-shaped module backed by FlexGEMM's COO operators."""
+    def __init__(self, in_ch, out_ch, kernel_size, stride=1, padding=0, subm=False):
+        super().__init__()
+        self.kernel_size = (kernel_size,) * 3 if isinstance(kernel_size, int) else tuple(kernel_size)
+        self.stride = (stride,) * 3 if isinstance(stride, int) else tuple(stride)
+        self.padding = (padding,) * 3 if isinstance(padding, int) else tuple(padding)
+        self.subm = subm
+        # Store weights in FlexGEMM's native [Co,Kx,Ky,Kz,Ci] layout so every
+        # forward avoids a fresh permute+contiguous copy.
+        self.weight = nn.Parameter(torch.empty(out_ch, *reversed(self.kernel_size), in_ch))
+        # FlexGEMM's sparse-conv backward requires a bias tensor.
+        self.register_buffer("bias", torch.zeros(out_ch), persistent=False)
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Accept spconv-format checkpoints [Co,Ci,Kz,Ky,Kx], as well as native
+        # FlexGEMM checkpoints [Co,Kx,Ky,Kz,Ci].
+        key = prefix + "weight"
+        source = state_dict.get(key)
+        legacy_shape = (self.weight.shape[0], self.weight.shape[-1], *self.kernel_size)
+        if source is not None and tuple(source.shape) == legacy_shape:
+            state_dict[key] = source.permute(0, 4, 3, 2, 1).contiguous()
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
+    def forward(self, x):
+        from flex_gemm.ops.spconv import sparse_submanifold_conv3d, sparse_conv3d
+        # Flex tensors already carry [b,x,y,z] coordinates and native weights.
+        coords = x.indices
+        d, h, w = x.spatial_shape
+        shape = torch.Size((x.batch_size, x.features.shape[1], w, h, d))
+        weight = self.weight
+        if self.subm:
+            cache_key = ("subm", x.spatial_shape, self.kernel_size, (1, 1, 1))
+            feats, neighbor_cache = sparse_submanifold_conv3d(
+                x.features.contiguous(), coords, shape, weight, self.bias,
+                neighbor_cache=x.neighbor_caches.get(cache_key),
+            )
+            x.neighbor_caches[cache_key] = neighbor_cache
+            out_coords = coords
+            out_shape = x.spatial_shape
+        else:
+            strides = tuple(reversed(self.stride))
+            padding = tuple(reversed(self.padding))
+            feats, out_coords, _ = sparse_conv3d(
+                x.features.contiguous(), coords, shape, weight, self.bias,
+                stride=strides, padding=padding,
+            )
+            out_shape = tuple((n + 2 * p - k) // s + 1 for n, p, k, s in
+                              zip(x.spatial_shape, self.padding, self.kernel_size, self.stride))
+        indices = out_coords
+        caches = x.neighbor_caches if self.subm else None
+        return _FlexTensor(feats, indices, out_shape, x.batch_size, caches)
+
+
+class SparseSequential(nn.Sequential):
+    def forward(self, x):
+        for layer in self:
+            if isinstance(layer, (nn.BatchNorm1d,)):
+                x = x.replace_feature(layer(x.features))
+            elif isinstance(layer, nn.SiLU):
+                x = x.replace_feature(layer(x.features))
+            else:
+                x = layer(x)
+        return x
+
+
+class SparseResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.n1 = nn.GroupNorm(min(8, in_ch), in_ch)
+        self.c1 = _FlexConv3d(in_ch, out_ch, 3, padding=1, subm=True)
+        self.n2 = nn.GroupNorm(min(8, out_ch), out_ch)
+        self.c2 = _FlexConv3d(out_ch, out_ch, 3, padding=1, subm=True)
+        self.short = _FlexConv3d(in_ch, out_ch, 1, subm=True) if in_ch != out_ch else None
+
+    def forward(self, x):
+        h = x.replace_feature(F.silu(self.n1(x.features)))
+        h = self.c1(h)
+        h = h.replace_feature(F.silu(self.n2(h.features)))
+        h = self.c2(h)
+        identity = self.short(x) if self.short is not None else x
+        return h.replace_feature(h.features + identity.features)
+
+
+class SparseResStage(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.b1 = SparseResBlock(in_ch, out_ch)
+        self.b2 = SparseResBlock(out_ch, out_ch)
+        self.down = _FlexConv3d(out_ch, out_ch, 3, stride=2, padding=1)
+
+    def forward(self, x):
+        return self.down(self.b2(self.b1(x)))
+
+
+class SparseDownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = SparseSequential(
+            _FlexConv3d(in_ch, out_ch, 3, padding=1, subm=True), nn.BatchNorm1d(out_ch), nn.SiLU(inplace=True),
+            _FlexConv3d(out_ch, out_ch, 3, stride=2, padding=1), nn.BatchNorm1d(out_ch), nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class VoxelGrid(nn.Module):
@@ -47,54 +184,6 @@ class VoxelConvDecoder(nn.Module):
         return self.net(x)
 
 
-class SparseResBlock(nn.Module):
-
-    def __init__(self, in_ch, out_ch, key):
-        super().__init__()
-        self.n1 = nn.GroupNorm(min(8, in_ch), in_ch)
-        self.c1 = spconv.SubMConv3d(in_ch, out_ch, 3, padding=1, bias=False, indice_key=key)
-        self.n2 = nn.GroupNorm(min(8, out_ch), out_ch)
-        self.c2 = spconv.SubMConv3d(out_ch, out_ch, 3, padding=1, bias=False, indice_key=key)
-        self.short = spconv.SubMConv3d(in_ch, out_ch, 1, bias=False) if in_ch != out_ch else None
-
-    def forward(self, x):
-        h = x.replace_feature(F.silu(self.n1(x.features)))
-        h = self.c1(h)
-        h = h.replace_feature(F.silu(self.n2(h.features)))
-        h = self.c2(h)
-        idt = self.short(x) if self.short is not None else x
-        return h.replace_feature(h.features + idt.features)
-
-
-class SparseResStage(nn.Module):
-
-    def __init__(self, in_ch, out_ch, key):
-        super().__init__()
-        self.b1 = SparseResBlock(in_ch, out_ch, key)
-        self.b2 = SparseResBlock(out_ch, out_ch, key)
-        self.down = spconv.SparseConv3d(out_ch, out_ch, 3, stride=2, padding=1, bias=False)
-
-    def forward(self, x):
-        return self.down(self.b2(self.b1(x)))
-
-
-class SparseDownBlock(nn.Module):
-
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.net = spconv.SparseSequential(
-            spconv.SubMConv3d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm1d(out_ch),
-            nn.SiLU(inplace=True),
-            spconv.SparseConv3d(out_ch, out_ch, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm1d(out_ch),
-            nn.SiLU(inplace=True),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
 class SpconvEncoder(nn.Module):
 
     def __init__(
@@ -131,18 +220,18 @@ class SpconvEncoder(nn.Module):
         self.spatial_shape = [int(input_shape[2]), int(input_shape[1]), int(input_shape[0])]
         self.bottleneck_shape_xyz = [bx, by, bz]
         if residual:
-            self.stem = spconv.SparseSequential(spconv.SubMConv3d(in_channels, channels[0], 1, bias=False))
+            self.stem = SparseSequential(_FlexConv3d(in_channels, channels[0], 1, subm=True))
             self.down_blocks = nn.ModuleList()
             prev_ch = channels[0]
             for i, ch in enumerate(channels):
-                self.down_blocks.append(SparseResStage(prev_ch, ch, key=f"res{i}"))
+                self.down_blocks.append(SparseResStage(prev_ch, ch))
                 prev_ch = ch
         else:
-            self.stem = spconv.SparseSequential(
-                spconv.SubMConv3d(in_channels, channels[0], 1, bias=False),
+            self.stem = SparseSequential(
+                _FlexConv3d(in_channels, channels[0], 1, subm=True),
                 nn.BatchNorm1d(channels[0]),
                 nn.SiLU(inplace=True),
-                spconv.SubMConv3d(channels[0], channels[0], 3, padding=1, bias=False),
+                _FlexConv3d(channels[0], channels[0], 3, padding=1, subm=True),
                 nn.BatchNorm1d(channels[0]),
                 nn.SiLU(inplace=True),
             )
@@ -166,12 +255,12 @@ class SpconvEncoder(nn.Module):
             cch = tuple(color_channels) if color_channels else tuple(channels)
             assert len(cch) == n_down, "color branch must downsample as often as the main one"
             col_in = 3 if self.color_rgb_only else in_channels
-            self.col_stem = spconv.SparseSequential(spconv.SubMConv3d(col_in, cch[0], 1, bias=False))
+            self.col_stem = SparseSequential(_FlexConv3d(col_in, cch[0], 1, subm=True))
             self.col_blocks = nn.ModuleList()
             prev = cch[0]
             for i, ch in enumerate(cch):
                 if residual:
-                    self.col_blocks.append(SparseResStage(prev, ch, key=f"cres{i}"))
+                    self.col_blocks.append(SparseResStage(prev, ch))
                 else:
                     self.col_blocks.append(SparseDownBlock(prev, ch))
                 prev = ch
@@ -221,7 +310,8 @@ class SpconvEncoder(nn.Module):
         y_idx = rem2 // W
         x_idx = rem2 % W
         unique_indices = torch.stack([b_idx, z_idx, y_idx, x_idx], dim=1).int()
-        return spconv.SparseConvTensor(feat_mean, unique_indices, self.spatial_shape, B)
+        flex_indices = unique_indices[:, [0, 3, 2, 1]].contiguous()
+        return _FlexTensor(feat_mean, flex_indices, self.spatial_shape, B)
 
     def _compute_bottleneck_occ_mask(self, xyz_world, batch_size):
         device = xyz_world.device
