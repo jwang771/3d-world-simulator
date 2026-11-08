@@ -16,4 +16,6 @@ dependencies:
       - lpips==0.1.4
       - gsplat==1.5.3
       - scipy==1.15.3
-      - spconv-cu126==2.3.8
+      - "flex_gemm @ git+https://github.com/JeffreyXiang/FlexGEMM.git ; sys_platform == 'linux'"
+      - "triton>=3.2.0 ; sys_platform == 'linux'"
+      - "triton-windows>=3.2.0 ; sys_platform == 'win32'"

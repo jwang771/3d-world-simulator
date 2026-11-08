@@ -333,6 +333,7 @@ def main():
     p.add_argument("--norm-params", default=None)
     p.add_argument("--resume", default=None)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--compile-mode", choices=("default", "reduce-overhead", "max-autotune"), default="default")
     a = p.parse_args()
     if a.seed is not None:
         random.seed(a.seed)
@@ -389,6 +390,9 @@ def main():
         start, best = int(ck["epoch"]) + 1, float(ck["best_val_loss"])
         for _ in range(start):
             scheduler.step()
+    from models.compile_utils import compile_sparse_encoder
+    compile_sparse_encoder(model.encoder, mode=a.compile_mode, scope="dense")
+    print(f"torch.compile enabled for encoder dense modules (mode={a.compile_mode})", flush=True)
     train_frames, val_frames = Frames(train_ds.files, device), Frames(val_ds.files, device)
     lpips_fn = lpips.LPIPS(net="vgg", verbose=False).to(device).eval()
     lpips_fn.requires_grad_(False)
