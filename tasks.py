@@ -53,4 +53,13 @@ TASKS = {
         wrist_cams=[],
         tactile=False,
     ),
+    "shoe_return": dict(
+        datasets=["shoe_return_sim"],
+        grid=(64, 48, 32),
+        x_range=(-0.60, 0.68),
+        y_range=(-0.56, 0.32),
+        z_range=(-0.09, 0.47),
+        wrist_cams=[3, 4],
+        tactile=False,
+    ),
 }

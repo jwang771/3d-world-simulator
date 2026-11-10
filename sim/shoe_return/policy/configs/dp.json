@@ -1,0 +1,2 @@
+{"kind": "dp", "chunk": 16, "batch": 64, "lr": 1e-4, "lr_backbone": 1e-4, "wd": 1e-6, "steps": 20000, "ema": true,
+ "model": {"steps": 100, "infer_steps": 10}}
